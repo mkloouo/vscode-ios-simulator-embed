@@ -39,6 +39,11 @@
           "type": "string",
           "default": "",
           "description": "If set, only windows whose owning bundle ID equals this value are streamed (copy bundleId from “List capture windows” NDJSON). Example: com.apple.iphonesimulator"
+        },
+        "ios-simulator-embed.simulatorUdid": {
+          "type": "string",
+          "default": "",
+          "description": "Booted simulator UDID for Indigo touch injection (`xcrun simctl list devices | grep Booted`). Leave empty if only one simulator is booted."
         }
       }
     }
@@ -47,7 +52,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build:native": "cd native/ios-sim-helper && swift build -c release"
+    "build:native": "bash native/ios-sim-helper/build.sh"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

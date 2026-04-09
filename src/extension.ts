@@ -4,25 +4,25 @@ import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
 
-type Bounds = { x: number; y: number; width: number; height: number };
-
 let activePanel: vscode.WebviewPanel | undefined;
 let streamProcess: cp.ChildProcessWithoutNullStreams | undefined;
-let latestBounds: Bounds | undefined;
 let lastFramePostedAt = 0;
 
 const debugOutputChannel = vscode.window.createOutputChannel("iOS Simulator Embed");
 
-/** Merged env for stream/click so the helper can filter by bundle ID. */
+/** Merged env for stream / Indigo touch (bundle id + optional booted UDID). */
 function helperEnvForCapture(): NodeJS.ProcessEnv {
-  const id = vscode.workspace
-    .getConfiguration("ios-simulator-embed")
-    .get<string>("targetBundleId")
-    ?.trim();
-  if (id) {
-    return { ...process.env, IOS_SIM_HELPER_BUNDLE_ID: id };
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+  const bid = cfg.get<string>("targetBundleId")?.trim();
+  if (bid) {
+    env.IOS_SIM_HELPER_BUNDLE_ID = bid;
   }
-  return { ...process.env };
+  const udid = cfg.get<string>("simulatorUdid")?.trim();
+  if (udid) {
+    env.IOS_SIM_UDID = udid;
+  }
+  return env;
 }
 
 function helperPath(context: vscode.ExtensionContext): string {
@@ -57,7 +57,6 @@ function stopStream() {
     streamProcess.kill("SIGTERM");
   }
   streamProcess = undefined;
-  latestBounds = undefined;
 }
 
 function panelHtml(webview: vscode.Webview): string {
@@ -82,7 +81,7 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator (Screen Recording + Accessibility). Left-click: the system cursor briefly moves to the Simulator and back so taps register.</div>
+  <div id="hint">Streamed Simulator (Screen Recording). Left-click sends Indigo HID taps (normalized to the image); works when the Simulator window is behind other apps. Set simulator UDID if multiple booted.</div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
   </div>
@@ -133,16 +132,10 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
 
   const rl = readline.createInterface({ input: child.stderr });
   rl.on("line", (line) => {
-    if (line.startsWith("BOUNDS:")) {
-      try {
-        const json = line.slice("BOUNDS:".length);
-        latestBounds = JSON.parse(json) as Bounds;
-      } catch {
-        /* ignore */
-      }
-    } else if (line.trim()) {
-      void vscode.window.showWarningMessage(`Simulator helper: ${line}`);
+    if (line.startsWith("BOUNDS:") || !line.trim()) {
+      return;
     }
+    void vscode.window.showWarningMessage(`Simulator helper: ${line}`);
   });
 
   let buf = Buffer.alloc(0);
@@ -184,22 +177,12 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
   });
 }
 
-function mapClickToQuartz(
-  bounds: Bounds,
-  clientX: number,
-  clientY: number,
-  dispW: number,
-  dispH: number
-): { x: number; y: number } | undefined {
+/** Normalized hit in [0,1]²; top-left of the streamed image matches Indigo top-left ratios. */
+function normalizedHit(clientX: number, clientY: number, dispW: number, dispH: number): { nx: number; ny: number } | undefined {
   if (dispW <= 0 || dispH <= 0) {
     return undefined;
   }
-  const lx = (clientX / dispW) * bounds.width;
-  const lyFromTop = (clientY / dispH) * bounds.height;
-  // Same space as `SCWindow.frame` / `NSEvent.mouseLocation` / `CGEvent` (global **points**, bottom-left origin).
-  const qx = bounds.x + lx;
-  const qy = bounds.y + bounds.height - lyFromTop;
-  return { x: qx, y: qy };
+  return { nx: clientX / dispW, ny: clientY / dispH };
 }
 
 function runListWindowsDebug(context: vscode.ExtensionContext) {
@@ -263,16 +246,15 @@ export function activate(context: vscode.ExtensionContext) {
           if (msg?.type !== "pointerDown" || msg.button !== 0) {
             return;
           }
-          const b = latestBounds;
           const bin = ensureHelperBuilt(context);
-          if (!b || !bin) {
+          if (!bin) {
             return;
           }
-          const pt = mapClickToQuartz(b, msg.x, msg.y, msg.w, msg.h);
-          if (!pt) {
+          const hit = normalizedHit(msg.x, msg.y, msg.w, msg.h);
+          if (!hit) {
             return;
           }
-          cp.spawn(bin, ["click", String(pt.x), String(pt.y)], {
+          cp.spawn(bin, ["touch", "tap", String(hit.nx), String(hit.ny)], {
             stdio: "ignore",
             detached: true,
             env: helperEnvForCapture(),

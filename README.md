@@ -1,12 +1,12 @@
 # iOS Simulator (streamed panel)
 
-VS Code / Cursor extension for **macOS** that streams the iOS Simulator window into a webview via **ScreenCaptureKit** and forwards **left-clicks** with **CGEvent**.
+VS Code / Cursor extension for **macOS** that streams the iOS Simulator window into a webview via **ScreenCaptureKit** and sends **taps** with **SimulatorKit Indigo HID** (private SPI), so touches reach the booted simulator even when its window is **behind other apps**.
 
-This is not true window embedding; it is a live JPEG stream plus synthetic pointer events.
+This is not true window embedding; it is a live JPEG stream plus host-side HID injection.
 
 ## Setup
 
-1. **Xcode Command Line Tools** (or Xcode) so `swift` is available.
+1. **Xcode** (not only CLT): the helper links **CoreSimulator** and **SimulatorKit** from your active developer dir (`xcode-select -p`).
 2. From the repo root:
 
    ```bash
@@ -15,34 +15,44 @@ This is not true window embedding; it is a live JPEG stream plus synthetic point
    npm run build:native
    ```
 
+   `build:native` runs [`native/ios-sim-helper/build.sh`](native/ios-sim-helper/build.sh), which adds framework search paths and **rpath** so the binary finds those frameworks at runtime.
+
 3. Open this folder in VS Code or Cursor, run **Run Extension** (F5).
 
 4. Command Palette: **iOS Simulator: Open streamed panel**.
 
-## Choosing the right window (bundle ID)
+## Choosing the right window (stream) and device (touch)
 
-Capture targets are chosen by **owning app bundle ID**, not window title (titles like `main` also appear on VS Code/Cursor).
+**Stream** — windows are filtered by **owning bundle ID** (not title):
 
-1. Command Palette: **iOS Simulator: List capture windows (debug)** — opens the **“iOS Simulator Embed”** output with one **NDJSON** line per window (`bundleId`, `appName`, `title`, `windowID`, frame, `area`). Lines are sorted by area (largest first).
-2. Copy the Simulator row’s `bundleId` into Settings → **iOS Simulator Embed: Target Bundle Id** (`ios-simulator-embed.targetBundleId`), or set env **`IOS_SIM_HELPER_BUNDLE_ID`** when launching the editor (same value the helper reads).
+1. **iOS Simulator: List capture windows (debug)** → Output **“iOS Simulator Embed”** (NDJSON, largest first).
+2. Set **Target Bundle Id** (`ios-simulator-embed.targetBundleId`) or env `IOS_SIM_HELPER_BUNDLE_ID`.
 
-CLI: `native/ios-sim-helper/.build/release/ios-sim-helper list`
+**Touch** — targets the **booted** simulator via CoreSimulator:
+
+- If only one simulator is booted, nothing else is required.
+- If several are booted, set **Simulator Udid** (`ios-simulator-embed.simulatorUdid`) or env `IOS_SIM_UDID` (`xcrun simctl list devices | grep Booted`).
+
+**Coordinates** — webview clicks are turned into **normalized (0–1, top-left)** positions over the streamed image. That matches Indigo’s ratio space for the **device surface** only approximately when the JPEG includes window chrome; adjust or crop later if needed.
 
 ## macOS permissions
 
-- **Screen Recording**: allow **Cursor** or **Visual Studio Code** (whichever hosts the Extension Host) when macOS prompts. Without this, capture can fail or show black frames.
-- **Accessibility**: synthetic clicks often require Accessibility permission for the same app. Enable it under **System Settings → Privacy & Security → Accessibility** if taps do nothing.
+- **Screen Recording**: allow the app that hosts the Extension Host (Cursor / VS Code) for capture.
+- **Accessibility** is **not** required for Indigo taps (unlike older `CGEvent` injection).
+
+## Private API / stability
+
+Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator updates can break this. See [`native/ios-sim-helper/THIRD_PARTY.md`](native/ios-sim-helper/THIRD_PARTY.md).
 
 ## Limits
 
-- **Coordinate mapping** assumes `SCWindow.frame` matches Quartz space used by `CGEvent`; multi-display or unusual scaling may need tweaks.
-- **Performance**: stream is throttled (~12 FPS capture + coalesced webview updates); still CPU-heavy.
-- **Packaging**: `.vscodeignore` excludes `native/**/.build`; for a `.vsix` you would ship a prebuilt `ios-sim-helper` binary (per architecture) under a path your extension resolves.
+- **Performance**: ~12 FPS capture + coalesced webview updates; still CPU-heavy.
+- **Packaging**: `.vscodeignore` excludes `native/**/.build`; ship a prebuilt `ios-sim-helper` per arch with the same rpath or an installer that sets `DYLD_FRAMEWORK_PATH` (discouraged for Gatekeeper).
 
 ## Native helper CLI
 
-Built at `native/ios-sim-helper/.build/release/ios-sim-helper`:
+`native/ios-sim-helper/.build/release/ios-sim-helper`:
 
-- `ios-sim-helper stream` — writes `BOUNDS:{json}\n` to stderr, then length-prefixed JPEG frames to stdout. Optional env `IOS_SIM_HELPER_BUNDLE_ID` restricts candidates to that bundle.
-- `ios-sim-helper click <x> <y>` — left click at Quartz global coordinates.
-- `ios-sim-helper list` — prints all shareable windows as NDJSON (debug).
+- `stream` — stderr `BOUNDS:…`, stdout length-prefixed JPEG. Env `IOS_SIM_HELPER_BUNDLE_ID` optional.
+- `touch tap <nx> <ny>` — Indigo tap; `nx`,`ny` in `[0,1]` from top-left of the simulated display. Env `IOS_SIM_UDID` optional.
+- `list` — NDJSON of shareable macOS windows (debug bundle IDs for streaming).

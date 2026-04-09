@@ -11,7 +11,7 @@
     {
       "label": "swift: release",
       "type": "shell",
-      "command": "swift build -c release",
+      "command": "bash build.sh",
       "options": { "cwd": "${workspaceFolder}/native/ios-sim-helper" },
       "problemMatcher": []
     }

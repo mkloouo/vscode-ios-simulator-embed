@@ -6,7 +6,7 @@
 //   stream — picks a Simulator window by **bundle ID** (see findSimulatorWindow), captures
 //            it with ScreenCaptureKit, writes JPEG frames to stdout (length-prefixed).
 //            Sends one BOUNDS line on stderr for click mapping.
-//   click  — synthesizes a left click at Quartz global (x, y).
+//   touch tap <nx> <ny> — Indigo HID touch (ratios 0…1 from top-left of device surface; works when Simulator is obscured).
 //   list   — prints every shareable on-screen window as **NDJSON** (debug: bundleId, title, …).
 //
 // The extension spawns this binary; it is not a .app bundle, so we must
@@ -22,8 +22,8 @@
 // =============================================================================
 
 import AppKit
-import ApplicationServices
 import CoreGraphics
+import IndigoTouch
 import CoreImage
 import CoreMedia
 import Foundation
@@ -60,12 +60,13 @@ enum HelperError: Error, CustomStringConvertible {
     case .usage:
       return """
       Usage:
-        ios-sim-helper stream              # capture (stderr BOUNDS, stdout JPEG frames)
-        ios-sim-helper click <x> <y>       # Quartz global point click
-        ios-sim-helper list                # NDJSON lines: all windows (use to read bundle IDs)
+        ios-sim-helper stream                    # capture (stderr BOUNDS, stdout JPEG frames)
+        ios-sim-helper touch tap <nx> <ny>       # Indigo HID tap; nx,ny in [0,1] top-left of simulated display
+        ios-sim-helper list                      # NDJSON: all windows (bundle IDs for stream)
 
       Optional environment:
-        IOS_SIM_HELPER_BUNDLE_ID=<id>      # exact owning bundle; only those windows are candidates for stream
+        IOS_SIM_HELPER_BUNDLE_ID=<id>            # stream: filter windows by owning bundle id
+        IOS_SIM_UDID=<uuid>                      # touch: booted device UDID (if multiple simulators booted)
       """
     case .noSimulatorWindow(let hint):
       return "No capture window found. \(hint)"
@@ -161,7 +162,7 @@ private func listCaptureCandidates() async throws {
   rows.sort { $0.area > $1.area }
 
   let enc = JSONEncoder()
-  enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+  enc.outputFormatting = [.sortedKeys]
   for r in rows {
     let data = try enc.encode(r)
     if let line = String(data: data, encoding: .utf8) {
@@ -194,46 +195,23 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
   return data as Data
 }
 
-// MARK: - Synthetic click
+// MARK: - Indigo HID touch (private SimulatorKit SPI)
 
-/// Posts a left click at `quartzGlobal` using the same coordinate space as `CGEvent` / `NSEvent.mouseLocation`
-/// (global **points**, origin at the **bottom-left** of the primary display, Y increases upward).
-///
-/// Why move the cursor first? Many AppKit apps (including Simulator) resolve clicks using the **hardware
-/// cursor position** as well as the event location. Posting only down/up without moving the cursor often
-/// misses the intended view and makes the pointer appear to “fight” the webview under your hand.
-///
-/// We save `NSEvent.mouseLocation`, `mouseMoved` to the target, click, then `mouseMoved` back so your
-/// cursor returns where you were in the editor.
-private func postClick(quartzGlobal: CGPoint) {
-  let before = NSEvent.mouseLocation
-
-  func moveMouse(to p: CGPoint) {
-    guard
-      let e = CGEvent(
-        mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)
-    else { return }
-    e.post(tap: .cghidEventTap)
+/// Sends touch-down then touch-up at normalized device coordinates. Returns an error message on failure.
+private func runTouchTap(normX: Double, normY: Double) -> String? {
+  var err = [CChar](repeating: 0, count: 512)
+  guard IOSEmbedLoadSimulatorFrameworks() else {
+    return "Failed to load CoreSimulator / SimulatorKit (is Xcode installed?)"
   }
-
-  moveMouse(to: quartzGlobal)
-  usleep(4_000)
-
-  guard
-    let down = CGEvent(
-      mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: quartzGlobal,
-      mouseButton: .left),
-    let up = CGEvent(
-      mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: quartzGlobal,
-      mouseButton: .left)
-  else { return }
-
-  down.post(tap: .cghidEventTap)
-  usleep(10_000)
-  up.post(tap: .cghidEventTap)
-
-  usleep(3_000)
-  moveMouse(to: CGPoint(x: before.x, y: before.y))
+  let udid: String? = ProcessInfo.processInfo.environment["IOS_SIM_UDID"]
+  guard IOSEmbedHIDSendTouch(udid, normX, normY, 1, &err, err.count) else {
+    return String(cString: err)
+  }
+  usleep(25_000)
+  guard IOSEmbedHIDSendTouch(udid, normX, normY, 2, &err, err.count) else {
+    return String(cString: err)
+  }
+  return nil
 }
 
 /// Backing scale of the `NSScreen` that contains the center of `windowFrame` (points, Cocoa global).
@@ -339,8 +317,7 @@ private func runStream() async throws {
 
 /// `@main` tells Swift this is the program entry. `async` lets us use `await` here.
 ///
-/// Flow: initialize Window Server on the main thread → parse argv → either one-shot
-/// `click` or long-running `stream`.
+/// Flow: initialize Window Server on the main thread → parse argv → `touch`, `stream`, or `list`.
 @main
 enum Entry {
   static func main() async {
@@ -355,16 +332,18 @@ enum Entry {
       exit(2)
     }
 
-    if first == "click" {
-      guard args.count == 3,
-        let x = Double(args[args.index(args.startIndex, offsetBy: 1)]),
-        let y = Double(args[args.index(args.startIndex, offsetBy: 2)])
-      else {
+    if first == "touch" {
+      let r = Array(args.dropFirst())
+      guard r.count == 3, r[0] == "tap", let nx = Double(r[1]), let ny = Double(r[2]) else {
         fputs("\(HelperError.usage)\n", stderr)
         exit(2)
       }
-      await MainActor.run {
-        postClick(quartzGlobal: CGPoint(x: x, y: y))
+      let fail: String? = await MainActor.run {
+        runTouchTap(normX: nx, normY: ny)
+      }
+      if let fail {
+        fputs("\(fail)\n", stderr)
+        exit(1)
       }
       exit(0)
     }
