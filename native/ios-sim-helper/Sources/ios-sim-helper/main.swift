@@ -11,14 +11,6 @@
 //
 // The extension spawns this binary; it is not a .app bundle, so we must
 // explicitly connect to the Window Server (see connectToWindowServer).
-//
-// Swift notes (if you are new to the language):
-//   • `async` / `await` — asynchronous functions; `await` suspends until done.
-//   • `throws` / `try` — functions that can fail with an Error; caller uses try.
-//   • `guard` — early exit unless a condition holds (keeps “happy path” unindented).
-//   • `?` after a type — optional (may be nil); `??` supplies a default if nil.
-//   • `@MainActor` — run this code on the main UI thread (required for much of AppKit).
-//   • `final class` — class that cannot be subclassed; NSObject is Apple’s Obj‑C base.
 // =============================================================================
 
 import AppKit
@@ -442,10 +434,7 @@ private func scWindowById(_ windowID: CGWindowID) async throws -> SCWindow? {
 
 // MARK: - ScreenCaptureKit delegate
 
-/// Receives `CMSampleBuffer` frames from `SCStream` (ScreenCaptureKit’s capture object).
-///
-/// `NSObject` + `SCStreamOutput` is the Objective‑C “delegate/protocol” pattern Swift inherits.
-/// Apple calls `stream(_:didOutputSampleBuffer:of:)` on the queue we pass when adding this output.
+/// SCStream delegate: encodes frames to JPEG on a serial queue.
 final class StreamOutput: NSObject, SCStreamOutput {
   let onFrame: (Data) -> Void
   /// Serial queue so we don’t encode JPEG or touch stdout from multiple threads at once.
@@ -643,9 +632,6 @@ private func runStream() async throws {
 
 // MARK: - Entry point
 
-/// `@main` tells Swift this is the program entry. `async` lets us use `await` here.
-///
-/// Flow: initialize Window Server on the main thread → parse argv → `touch`, `stream`, or `list`.
 @main
 enum Entry {
   static func main() async {

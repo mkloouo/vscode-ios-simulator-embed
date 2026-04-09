@@ -1150,8 +1150,12 @@ export function activate(context: vscode.ExtensionContext) {
             return;
           }
 
-          const mt = m.type;
-          if (mt !== "touchDown" && mt !== "touchMove" && mt !== "touchUp" && mt !== "touchCancel") {
+          if (
+            m.type !== "touchDown" &&
+            m.type !== "touchMove" &&
+            m.type !== "touchUp" &&
+            m.type !== "touchCancel"
+          ) {
             return;
           }
           if (

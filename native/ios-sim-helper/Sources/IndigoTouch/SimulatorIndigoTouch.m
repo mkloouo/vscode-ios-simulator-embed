@@ -12,7 +12,6 @@
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
-#import <malloc/malloc.h>
 #import <string.h>
 
 static const unsigned long long kSimDeviceStateBooted = 3;
