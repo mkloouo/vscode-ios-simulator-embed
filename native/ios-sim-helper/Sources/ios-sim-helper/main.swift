@@ -109,18 +109,20 @@ private func findSimulatorWindow() async throws -> SCWindow {
 /// Converts one video frame (`CMSampleBuffer`) from the capture pipeline into JPEG `Data`.
 ///
 /// Pipeline: pixel buffer → Core Image → `CGImage` → ImageIO JPEG encoder.
-/// We compress a bit (0.72) to keep bandwidth reasonable for the extension/webview.
+/// We compress a bit to keep bandwidth reasonable for the extension/webview.
+/// Reusing one `CIContext` avoids creating a new Metal/GL context every frame (big CPU/GPU win).
+private let sharedJPEGContext = CIContext(options: [.useSoftwareRenderer: false])
+
 private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
   guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
   let ciImage = CIImage(cvPixelBuffer: buffer)
-  let context = CIContext(options: [.useSoftwareRenderer: false])
-  guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+  guard let cgImage = sharedJPEGContext.createCGImage(ciImage, from: ciImage.extent) else { return nil }
   let data = NSMutableData()
   guard
     let dest = CGImageDestinationCreateWithData(
       data as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil)
   else { return nil }
-  let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.72]
+  let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.55]
   CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
   guard CGImageDestinationFinalize(dest) else { return nil }
   return data as Data
@@ -128,21 +130,55 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
 
 // MARK: - Synthetic click
 
-/// Posts a left mouse down + up at the given point in **Quartz global coordinates**
-/// (origin bottom-left of the combined desktop space, as used by `CGEvent`).
+/// Posts a left click at `quartzGlobal` using the same coordinate space as `CGEvent` / `NSEvent.mouseLocation`
+/// (global **points**, origin at the **bottom-left** of the primary display, Y increases upward).
 ///
-/// The TypeScript side maps from webview/image coordinates into this space using
-/// the BOUNDS line emitted on stderr.
+/// Why move the cursor first? Many AppKit apps (including Simulator) resolve clicks using the **hardware
+/// cursor position** as well as the event location. Posting only down/up without moving the cursor often
+/// misses the intended view and makes the pointer appear to “fight” the webview under your hand.
+///
+/// We save `NSEvent.mouseLocation`, `mouseMoved` to the target, click, then `mouseMoved` back so your
+/// cursor returns where you were in the editor.
 private func postClick(quartzGlobal: CGPoint) {
-  let down = CGEvent(
-    mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: quartzGlobal,
-    mouseButton: .left)
-  let up = CGEvent(
-    mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: quartzGlobal,
-    mouseButton: .left)
-  down?.post(tap: .cghidEventTap)
-  usleep(8_000)  // tiny gap so the OS sees distinct down/up
-  up?.post(tap: .cghidEventTap)
+  let before = NSEvent.mouseLocation
+
+  func moveMouse(to p: CGPoint) {
+    guard
+      let e = CGEvent(
+        mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)
+    else { return }
+    e.post(tap: .cghidEventTap)
+  }
+
+  moveMouse(to: quartzGlobal)
+  usleep(4_000)
+
+  guard
+    let down = CGEvent(
+      mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: quartzGlobal,
+      mouseButton: .left),
+    let up = CGEvent(
+      mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: quartzGlobal,
+      mouseButton: .left)
+  else { return }
+
+  down.post(tap: .cghidEventTap)
+  usleep(10_000)
+  up.post(tap: .cghidEventTap)
+
+  usleep(3_000)
+  moveMouse(to: CGPoint(x: before.x, y: before.y))
+}
+
+/// Backing scale of the `NSScreen` that contains the center of `windowFrame` (points, Cocoa global).
+private func backingScale(for windowFrame: CGRect) -> CGFloat {
+  let mid = CGPoint(x: windowFrame.midX, y: windowFrame.midY)
+  for screen in NSScreen.screens {
+    if screen.frame.contains(mid) {
+      return screen.backingScaleFactor
+    }
+  }
+  return NSScreen.main?.backingScaleFactor ?? 2.0
 }
 
 // MARK: - ScreenCaptureKit delegate
@@ -181,11 +217,13 @@ final class StreamOutput: NSObject, SCStreamOutput {
 private func runStream() async throws {
   let window = try await findSimulatorWindow()
   let frame = window.frame
-  let boundsPayload: [String: CGFloat] = [
-    "x": frame.origin.x,
-    "y": frame.origin.y,
-    "width": frame.width,
-    "height": frame.height,
+  let scale = backingScale(for: frame)
+  // `SCWindow.frame` is in **points** (Cocoa global); same space as `NSEvent.mouseLocation` / `CGEvent`.
+  let boundsPayload: [String: Double] = [
+    "x": Double(frame.origin.x),
+    "y": Double(frame.origin.y),
+    "width": Double(frame.width),
+    "height": Double(frame.height),
   ]
   let json = try JSONSerialization.data(withJSONObject: boundsPayload, options: [])
   guard let line = String(data: json, encoding: .utf8) else { throw HelperError.streamFailed("bounds encode") }
@@ -194,10 +232,12 @@ private func runStream() async throws {
   // Capture only this window (not the whole display).
   let filter = SCContentFilter(desktopIndependentWindow: window)
   let config = SCStreamConfiguration()
-  // ~2x size for Retina-ish sharpness; cap dimensions for safety.
-  config.width = Int(min(frame.width * 2, 4096))
-  config.height = Int(min(frame.height * 2, 4096))
-  config.minimumFrameInterval = CMTime(value: 1, timescale: 30)  // ~30 fps
+  // 1× logical size + moderate FPS keeps GPU/CPU down; still readable in the webview.
+  let capW = min(frame.width * scale, 2560)
+  let capH = min(frame.height * scale, 2560)
+  config.width = max(1, Int(capW))
+  config.height = max(1, Int(capH))
+  config.minimumFrameInterval = CMTime(value: 1, timescale: 12)  // ~12 fps
   config.pixelFormat = kCVPixelFormatType_32BGRA as OSType
   config.showsCursor = false
   config.capturesAudio = false

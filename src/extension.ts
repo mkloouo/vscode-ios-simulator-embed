@@ -9,6 +9,7 @@ type Bounds = { x: number; y: number; width: number; height: number };
 let activePanel: vscode.WebviewPanel | undefined;
 let streamProcess: cp.ChildProcessWithoutNullStreams | undefined;
 let latestBounds: Bounds | undefined;
+let lastFramePostedAt = 0;
 
 function helperPath(context: vscode.ExtensionContext): string {
   return path.join(
@@ -67,7 +68,7 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator (macOS Screen Recording permission required). Click/tap forwards a left click.</div>
+  <div id="hint">Streamed Simulator (Screen Recording + Accessibility). Left-click: the system cursor briefly moves to the Simulator and back so taps register.</div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
   </div>
@@ -108,6 +109,7 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
   }
 
   stopStream();
+  lastFramePostedAt = 0;
 
   const child = cp.spawn(bin, ["stream"], { stdio: ["pipe", "pipe", "pipe"] });
   streamProcess = child;
@@ -142,6 +144,12 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
       const jpeg = buf.subarray(4, 4 + len);
       buf = buf.subarray(4 + len);
       const b64 = jpeg.toString("base64");
+      // Drop frames if the webview is still busy — keeps the extension host and renderer lighter.
+      const now = Date.now();
+      if (now - lastFramePostedAt < 66) {
+        continue;
+      }
+      lastFramePostedAt = now;
       panel.webview.postMessage({ type: "frame", dataUrl: `data:image/jpeg;base64,${b64}` });
     }
   });
@@ -171,6 +179,7 @@ function mapClickToQuartz(
   }
   const lx = (clientX / dispW) * bounds.width;
   const lyFromTop = (clientY / dispH) * bounds.height;
+  // Same space as `SCWindow.frame` / `NSEvent.mouseLocation` / `CGEvent` (global **points**, bottom-left origin).
   const qx = bounds.x + lx;
   const qy = bounds.y + bounds.height - lyFromTop;
   return { x: qx, y: qy };
