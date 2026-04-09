@@ -69,6 +69,23 @@
           "type": "boolean",
           "default": true,
           "description": "MAP: treat vertical letterbox as chrome above the LCD only (padBottom = 0, LCD bottom-aligned in the captured window). Disable to use centered vertical fit (equal padTop/padBottom)."
+        },
+        "ios-simulator-embed.streamMaxWidthPx": {
+          "type": "number",
+          "default": 430,
+          "minimum": 0,
+          "description": "Max width of the streamed image in the panel (CSS px). The image keeps aspect ratio and never exceeds the panel width. Use 0 for no cap (fill the panel width). Default 430 matches a typical phone width so the stream does not stretch across a wide editor."
+        },
+        "ios-simulator-embed.streamMaxHeightPx": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional max height of the streamed image (CSS px). 0 means no height cap (height follows width and aspect ratio)."
+        },
+        "ios-simulator-embed.streamShowUsageHint": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the expandable MAP / debug / toolbar help block at the top of the stream panel. When false, only a one-line reminder is shown."
         }
       }
     }

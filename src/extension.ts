@@ -65,6 +65,28 @@ function mapDebugEnabled(): boolean {
   return !!vscode.workspace.getConfiguration("ios-simulator-embed").get<boolean>("debugMap");
 }
 
+type StreamPanelInitPayload = {
+  debugTouches: boolean;
+  streamPads: StreamPads;
+  streamLayout: { maxWidthPx: number; maxHeightPx: number };
+  streamShowUsageHint: boolean;
+};
+
+function streamPanelInitPayload(): StreamPanelInitPayload {
+  const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+  const maxW = cfg.get<number>("streamMaxWidthPx");
+  const maxH = cfg.get<number>("streamMaxHeightPx");
+  return {
+    debugTouches: !!cfg.get("debugTouches"),
+    streamPads: { ...streamPads },
+    streamLayout: {
+      maxWidthPx: typeof maxW === "number" && Number.isFinite(maxW) ? Math.max(0, Math.round(maxW)) : 430,
+      maxHeightPx: typeof maxH === "number" && Number.isFinite(maxH) ? Math.max(0, Math.round(maxH)) : 0,
+    },
+    streamShowUsageHint: !!cfg.get("streamShowUsageHint"),
+  };
+}
+
 function logMapDiag(message: string, reveal: boolean) {
   debugOutputChannel.appendLine(message);
   if (reveal && mapDebugEnabled()) {
@@ -151,15 +173,27 @@ function panelHtml(webview: vscode.Webview): string {
     .chromeIconBtn { padding: 8px; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
     .chromeIconBtn svg { display: block; flex-shrink: 0; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    #wrap { position: relative; display: inline-block; max-width: 100%; }
-    #frame { display: block; max-width: 100%; height: auto; cursor: pointer; user-select: none; touch-action: none; background: #111; }
-    #hint { font-size: 12px; opacity: 0.75; margin-bottom: 8px; line-height: 1.35; }
+    #wrap { position: relative; display: inline-block; max-width: 100%; box-sizing: border-box; }
+    #frame { display: block; width: auto; height: auto; max-width: 100%; cursor: pointer; user-select: none; touch-action: none; background: #111; box-sizing: border-box; }
+    .hint-compact { font-size: 12px; opacity: 0.8; margin: 0 0 8px 0; line-height: 1.35; }
+    #hintDetails { font-size: 12px; margin-bottom: 8px; line-height: 1.35; }
+    #hintDetails[hidden] { display: none !important; }
+    #hintDetails summary { cursor: pointer; opacity: 0.85; user-select: none; }
+    .hint-body { margin-top: 6px; opacity: 0.75; padding-left: 2px; }
     #debugHud { position: absolute; left: 4px; bottom: 4px; margin: 0; padding: 4px 6px; font-size: 10px; line-height: 1.25; font-family: var(--vscode-editor-font-family); background: color-mix(in srgb, var(--vscode-editor-background) 85%, black); color: var(--vscode-editor-foreground); border-radius: 4px; max-width: calc(100% - 8px); pointer-events: none; z-index: 2; white-space: pre-wrap; }
     #debugHud[hidden] { display: none !important; }
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD aligned to bottom of the capture. Disable for centered vertical fit. Debug: <code>debugMap</code>, <code>debugTouches</code>, <code>debugTouchPipeline</code>, command <strong>Touch / MAP debug checklist</strong>; reopen panel after MAP / pipeline env changes. <code>simulatorUdid</code> if needed. Toolbar: Home, Screenshot, Rotate (host shortcuts via Simulator + Accessibility).</div>
+  <p id="hintCompact" class="hint-compact"></p>
+  <details id="hintDetails" hidden>
+    <summary>MAP, touch debug, toolbar (optional)</summary>
+    <div class="hint-body">
+      MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD bottom-aligned in the capture. Disable for centered vertical fit.
+      Debug: <code>debugMap</code>, <code>debugTouches</code>, <code>debugTouchPipeline</code>; command <strong>Touch / MAP debug checklist</strong>. Reopen the panel after MAP / pipeline env changes.
+      <code>simulatorUdid</code> if needed. Toolbar: Home (double-click quickly for app switcher), Screenshot, Rotate — host shortcuts via Simulator + Accessibility.
+    </div>
+  </details>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
     <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Click twice within ~0.4s for app switcher (double home). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Home</span>
@@ -181,10 +215,51 @@ function panelHtml(webview: vscode.Webview): string {
   <script nonce="streampanel">
     const vscode = acquireVsCodeApi();
     const img = document.getElementById('frame');
+    const wrap = document.getElementById('wrap');
+    const hintCompact = document.getElementById('hintCompact');
+    const hintDetails = document.getElementById('hintDetails');
     const debugHud = document.getElementById('debugHud');
     let activePointer = null;
     let debugTouches = false;
     let streamPads = { padLeft: 0, padRight: 0, padTop: 0, padBottom: 0 };
+
+    function applyStreamLayout(layout) {
+      if (!layout || typeof layout !== 'object') return;
+      const mw = layout.maxWidthPx;
+      const mh = layout.maxHeightPx;
+      if (typeof mw === 'number' && mw > 0) {
+        img.style.maxWidth = mw + 'px';
+        if (wrap) wrap.style.maxWidth = mw + 'px';
+      } else {
+        img.style.maxWidth = '100%';
+        if (wrap) wrap.style.maxWidth = '100%';
+      }
+      if (typeof mh === 'number' && mh > 0) {
+        img.style.maxHeight = mh + 'px';
+        img.style.objectFit = 'contain';
+      } else {
+        img.style.maxHeight = '';
+        img.style.objectFit = '';
+      }
+    }
+
+    function applyStreamChrome(init) {
+      if (init.streamLayout) applyStreamLayout(init.streamLayout);
+      if (hintDetails) {
+        const show = !!init.streamShowUsageHint;
+        hintDetails.hidden = !show;
+        if (!show) hintDetails.open = false;
+      }
+      if (hintCompact) {
+        const w = init.streamLayout && init.streamLayout.maxWidthPx > 0 ? init.streamLayout.maxWidthPx + 'px' : 'full width';
+        const h =
+          init.streamLayout && init.streamLayout.maxHeightPx > 0
+            ? init.streamLayout.maxHeightPx + 'px'
+            : 'auto';
+        hintCompact.textContent =
+          'Stream max ' + w + ' × ' + h + ' (settings: streamMaxWidthPx, streamMaxHeightPx). Enable streamShowUsageHint for MAP/debug notes.';
+      }
+    }
 
     document.querySelectorAll('.chromeBtn').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -203,6 +278,7 @@ function panelHtml(webview: vscode.Webview): string {
         if (msg.streamPads && typeof msg.streamPads === 'object') {
           streamPads = { ...streamPads, ...msg.streamPads };
         }
+        applyStreamChrome(msg);
         debugHud.hidden = !debugTouches;
         if (!debugTouches) debugHud.textContent = '';
       }
@@ -870,6 +946,12 @@ function runTouchMapDebugHelp() {
   debugOutputChannel.appendLine(
     "• ios-simulator-embed.mapStackVerticalLetterboxOnTop — vertical letterbox above LCD vs centered fit."
   );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.streamMaxWidthPx / streamMaxHeightPx — cap the streamed image size in the panel (default width 430px)."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.streamShowUsageHint — expandable MAP/debug help at the top of the stream panel."
+  );
   debugOutputChannel.appendLine("");
   debugOutputChannel.appendLine("Commands:");
   debugOutputChannel.appendLine("• iOS Simulator: List capture windows (debug) — NDJSON of ScreenCaptureKit shareable windows.");
@@ -942,13 +1024,13 @@ export function activate(context: vscode.ExtensionContext) {
       if (!activePanel) {
         return;
       }
-      if (e.affectsConfiguration("ios-simulator-embed.debugTouches")) {
-        const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
-        activePanel.webview.postMessage({
-          type: "init",
-          debugTouches: !!cfg.get("debugTouches"),
-          streamPads: { ...streamPads },
-        });
+      if (
+        e.affectsConfiguration("ios-simulator-embed.debugTouches") ||
+        e.affectsConfiguration("ios-simulator-embed.streamMaxWidthPx") ||
+        e.affectsConfiguration("ios-simulator-embed.streamMaxHeightPx") ||
+        e.affectsConfiguration("ios-simulator-embed.streamShowUsageHint")
+      ) {
+        activePanel.webview.postMessage({ type: "init", ...streamPanelInitPayload() });
       }
       if (e.affectsConfiguration("ios-simulator-embed.debugMap")) {
         debugOutputChannel.appendLine(
@@ -999,12 +1081,7 @@ export function activate(context: vscode.ExtensionContext) {
           const m = msg as Record<string, unknown>;
 
           if (m.type === "panelReady") {
-            const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
-            panel.webview.postMessage({
-              type: "init",
-              debugTouches: !!cfg.get("debugTouches"),
-              streamPads: { ...streamPads },
-            });
+            panel.webview.postMessage({ type: "init", ...streamPanelInitPayload() });
             return;
           }
 
