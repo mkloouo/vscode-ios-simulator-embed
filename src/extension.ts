@@ -36,7 +36,21 @@ function helperEnvForCapture(): NodeJS.ProcessEnv {
   if (udid) {
     env.IOS_SIM_UDID = udid;
   }
+  if (cfg.get<boolean>("debugMap")) {
+    env.IOS_SIM_HELPER_MAP_DEBUG = "1";
+  }
   return env;
+}
+
+function mapDebugEnabled(): boolean {
+  return !!vscode.workspace.getConfiguration("ios-simulator-embed").get<boolean>("debugMap");
+}
+
+function logMapDiag(message: string, reveal: boolean) {
+  debugOutputChannel.appendLine(message);
+  if (reveal && mapDebugEnabled()) {
+    debugOutputChannel.show(true);
+  }
 }
 
 function helperPath(context: vscode.ExtensionContext): string {
@@ -122,7 +136,7 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. Toolbar: home &amp; rotate briefly activate Simulator to send a shortcut, then restore the editor; screenshot uses <code>simctl</code> only. Accessibility required for System Events. <code>debugTouches</code> for coordinates; <code>simulatorUdid</code> if MAP is wrong.</div>
+  <div id="hint">Streamed Simulator. Enable <code>debugMap</code> for Output logs when LCD letterbox (MAP) is skipped or rejected; reopen the panel after toggling. <code>debugTouches</code> for pointer coords. <code>simulatorUdid</code> if MAP/insets are wrong. Toolbar uses <code>simctl</code> / Accessibility as before.</div>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
     <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Home</span>
@@ -299,6 +313,37 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
       return;
     }
     if (s.startsWith("BOUNDS:")) {
+      if (mapDebugEnabled()) {
+        try {
+          const raw = JSON.parse(s.slice(7)) as Record<string, unknown>;
+          logMapDiag(`[MAP] BOUNDS (window frame pt): ${JSON.stringify(raw)}`, false);
+        } catch {
+          logMapDiag(`[MAP] BOUNDS (unparsed): ${s.slice(0, 200)}`, false);
+        }
+      }
+      return;
+    }
+    if (s.startsWith("MAP_SKIP:")) {
+      try {
+        const raw = JSON.parse(s.slice(9)) as Record<string, unknown>;
+        logMapDiag(
+          `[MAP] helper did not emit MAP line (inset correction disabled): ${JSON.stringify(raw, null, 2)}`,
+          true
+        );
+      } catch {
+        logMapDiag(`[MAP] MAP_SKIP (unparsed): ${s.slice(9)}`, true);
+      }
+      return;
+    }
+    if (s.startsWith("MAP_DEBUG:")) {
+      if (mapDebugEnabled()) {
+        try {
+          const raw = JSON.parse(s.slice(10)) as Record<string, unknown>;
+          logMapDiag(`[MAP] helper debug: ${JSON.stringify(raw, null, 2)}`, true);
+        } catch {
+          logMapDiag(`[MAP] MAP_DEBUG (unparsed): ${s.slice(10)}`, true);
+        }
+      }
       return;
     }
     if (s.startsWith("MAP:")) {
@@ -309,18 +354,49 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
         const padRight = n("padRight");
         const padTop = n("padTop");
         const padBottom = n("padBottom");
-        const ok = [padLeft, padRight, padTop, padBottom].every(
-          (v) => Number.isFinite(v) && v >= 0 && v < 1 && v <= 0.49
-        );
-        if (ok && padLeft + padRight < 1 && padTop + padBottom < 1) {
+        const finite = [padLeft, padRight, padTop, padBottom].every((v) => Number.isFinite(v));
+        const rangeOk = [padLeft, padRight, padTop, padBottom].every((v) => v >= 0 && v < 1);
+        const capOk = [padLeft, padRight, padTop, padBottom].every((v) => v <= 0.49);
+        const hSum = padLeft + padRight;
+        const vSum = padTop + padBottom;
+        const sumOk = hSum < 1 && vSum < 1;
+        const ok = finite && rangeOk && capOk && sumOk;
+        if (ok) {
           streamPads = { padLeft, padRight, padTop, padBottom };
+          if (mapDebugEnabled()) {
+            logMapDiag(
+              `[MAP] applied insets L,R,T,B = ${padLeft.toFixed(6)}, ${padRight.toFixed(6)}, ${padTop.toFixed(6)}, ${padBottom.toFixed(6)}`,
+              true
+            );
+          }
           activePanel?.webview.postMessage({
             type: "streamMap",
             pads: { padLeft, padRight, padTop, padBottom },
           });
+        } else {
+          const reasons: string[] = [];
+          if (!finite) {
+            reasons.push("one or more pads are not finite numbers");
+          }
+          if (!rangeOk) {
+            reasons.push("expected each pad in [0,1)");
+          }
+          if (!capOk) {
+            reasons.push("extension rule: each pad must be ≤ 0.49 (reject oversized letterbox)");
+          }
+          if (!sumOk) {
+            reasons.push(
+              `horizontal pads sum ${hSum.toFixed(4)} or vertical ${vSum.toFixed(4)} must be < 1`
+            );
+          }
+          logMapDiag(
+            `[MAP] received MAP line but extension rejected it — ${reasons.join("; ")}. ` +
+              `values: L=${String(raw.padLeft)} R=${String(raw.padRight)} T=${String(raw.padTop)} B=${String(raw.padBottom)}`,
+            true
+          );
         }
-      } catch {
-        /* ignore malformed MAP */
+      } catch (e) {
+        logMapDiag(`[MAP] JSON parse failed for MAP line: ${String(e)} — raw: ${s.slice(0, 180)}`, true);
       }
       return;
     }
@@ -611,15 +687,25 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (!e.affectsConfiguration("ios-simulator-embed.debugTouches") || !activePanel) {
+      if (!activePanel) {
         return;
       }
-      const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
-      activePanel.webview.postMessage({
-        type: "init",
-        debugTouches: !!cfg.get("debugTouches"),
-        streamPads: { ...streamPads },
-      });
+      if (e.affectsConfiguration("ios-simulator-embed.debugTouches")) {
+        const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+        activePanel.webview.postMessage({
+          type: "init",
+          debugTouches: !!cfg.get("debugTouches"),
+          streamPads: { ...streamPads },
+        });
+      }
+      if (e.affectsConfiguration("ios-simulator-embed.debugMap")) {
+        debugOutputChannel.appendLine(
+          "[MAP] `debugMap` changed — stop and reopen the streamed panel so the capture helper restarts with MAP_DEBUG env and fresh stderr lines."
+        );
+        if (mapDebugEnabled()) {
+          debugOutputChannel.show(true);
+        }
+      }
     })
   );
 

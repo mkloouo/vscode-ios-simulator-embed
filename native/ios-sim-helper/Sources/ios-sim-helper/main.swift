@@ -426,9 +426,45 @@ private func runStream() async throws {
   let envUdid =
     ProcessInfo.processInfo.environment["IOS_SIM_UDID"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
   let udidForMap: String? = envUdid.isEmpty ? nil : envUdid
+  let udidLabel = udidForMap ?? "(nil → first booted device)"
+  let mapDebugEnv =
+    ProcessInfo.processInfo.environment["IOS_SIM_HELPER_MAP_DEBUG"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    ?? ""
+  let mapDebug = mapDebugEnv == "1" || mapDebugEnv.lowercased() == "true" || mapDebugEnv.lowercased() == "yes"
+
+  func writeMapDiagLine(_ tag: String, _ obj: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: []),
+      let json = String(data: data, encoding: .utf8)
+    else {
+      return
+    }
+    FileHandle.standardError.write(Data("\(tag):\(json)\n".utf8))
+  }
+
   var dW: Double = 0
   var dH: Double = 0
-  if IOSEmbedBootedMainScreenLogicalSize(udidForMap, &dW, &dH, &errMap, errMap.count), dW > 0, dH > 0 {
+  if !IOSEmbedBootedMainScreenLogicalSize(udidForMap, &dW, &dH, &errMap, errMap.count) {
+    let detail = String(cString: errMap).trimmingCharacters(in: .whitespacesAndNewlines)
+    writeMapDiagLine(
+      "MAP_SKIP",
+      [
+        "reason": "booted_main_screen_logical_size_failed",
+        "detail": String(detail.prefix(500)),
+        "iosSimUdidFilter": udidLabel,
+        "windowSizePt": ["w": Double(frame.width), "h": Double(frame.height)],
+        "hint":
+          "Boot a simulator; if several are booted set IOS_SIM_UDID (extension: simulatorUdid) to match the streamed device.",
+      ])
+  } else if dW <= 0 || dH <= 0 {
+    writeMapDiagLine(
+      "MAP_SKIP",
+      [
+        "reason": "invalid_main_screen_dimensions",
+        "mainScreenLogical": ["w": dW, "h": dH],
+        "iosSimUdidFilter": udidLabel,
+        "windowSizePt": ["w": Double(frame.width), "h": Double(frame.height)],
+      ])
+  } else {
     let ins = mapInsetsForDeviceInWindow(
       windowWidth: Double(frame.width),
       windowHeight: Double(frame.height),
@@ -445,6 +481,27 @@ private func runStream() async throws {
       let mline = String(data: mj, encoding: .utf8)
     {
       FileHandle.standardError.write(Data("MAP:\(mline)\n".utf8))
+      if mapDebug {
+        writeMapDiagLine(
+          "MAP_DEBUG",
+          [
+            "phase": "map_emitted",
+            "windowSizePt": ["w": Double(frame.width), "h": Double(frame.height)],
+            "mainScreenLogical": ["w": dW, "h": dH],
+            "pads": mapPayload,
+            "iosSimUdidFilter": udidLabel,
+            "note":
+              "Pads are fractions of the captured window; extension remaps pointer (x/w,y/h) through this inner rect before Indigo.",
+          ])
+      }
+    } else {
+      writeMapDiagLine(
+        "MAP_SKIP",
+        [
+          "reason": "map_json_encode_failed",
+          "iosSimUdidFilter": udidLabel,
+          "mainScreenLogical": ["w": dW, "h": dH],
+        ])
     }
   }
 

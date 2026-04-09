@@ -49,6 +49,11 @@
           "type": "boolean",
           "default": false,
           "description": "Log each touch to the Output panel (iOS Simulator Embed) and show a small coordinate HUD in the stream webview."
+        },
+        "ios-simulator-embed.debugMap": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log LCD letterbox (MAP) diagnostics: show Output when MAP is skipped, reject reasons, and verbose MAP_DEBUG from the native stream helper."
         }
       }
     }
