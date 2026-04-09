@@ -29,7 +29,9 @@ Screen recording converted to GIF (first ~28s, 720px wide). Streamed panel with 
 
 3. Open this folder in VS Code or Cursor, run **Run Extension** (F5).
 
-4. Command Palette: **iOS Simulator: Open streamed panel**.
+4. Command Palette: **iOS Simulator: Start streamed panel** (stop with **Stop streamed panel**).
+
+5. With **multiple booted simulators**, run **iOS Simulator: Select booted simulator (UDID)** so MAP, touches, and screenshots target one device.
 
 ## Choosing the right window (stream) and device (touch)
 
@@ -38,10 +40,10 @@ Screen recording converted to GIF (first ~28s, 720px wide). Streamed panel with 
 1. **iOS Simulator: List capture windows (debug)** → Output **“iOS Simulator Embed”** (NDJSON, largest first).
 2. Set **Target Bundle Id** (`ios-simulator-embed.targetBundleId`) or env `IOS_SIM_HELPER_BUNDLE_ID`.
 
-**Touch** — targets the **booted** simulator via CoreSimulator:
+**Touch / MAP / screenshot device** — targets a **booted** simulator via CoreSimulator and `simctl`:
 
-- If only one simulator is booted, nothing else is required.
-- If several are booted, set **Simulator Udid** (`ios-simulator-embed.simulatorUdid`) or env `IOS_SIM_UDID` (`xcrun simctl list devices | grep Booted`).
+- If only one simulator is booted, you can leave **Simulator Udid** empty.
+- If several are booted, use **iOS Simulator: Select booted simulator (UDID)** (writes User setting `ios-simulator-embed.simulatorUdid`) or set env `IOS_SIM_UDID` manually.
 
 **Coordinates** — webview clicks are turned into **normalized (0–1, top-left)** positions over the streamed image. That matches Indigo’s ratio space for the **device surface** only approximately when the JPEG includes window chrome; adjust or crop later if needed.
 
@@ -49,6 +51,12 @@ Screen recording converted to GIF (first ~28s, 720px wide). Streamed panel with 
 
 - **Screen Recording**: allow the app that hosts the Extension Host (Cursor / VS Code) for capture.
 - **Accessibility** (Automation): **not** required for stream touches (Indigo HID), but **required** for the panel toolbar shortcuts (Home, Rotate) which drive **Simulator** via **System Events** / AppleScript. **Screenshot** uses `simctl` only.
+
+## Spaces (Mission Control / virtual desktops)
+
+ScreenCaptureKit only sees windows on the **same Space** as the app that runs the extension host (Cursor / VS Code). If the Simulator window is on **another desktop**, **start the stream will not capture it** until you move Simulator to the desktop where the editor is, then run **Start streamed panel** again.
+
+After capture has started successfully, you can **move Simulator to another Space**; the **stream and touch forwarding** usually keep working. The **three toolbar buttons** (Home, Screenshot, Rotate) **may stop working** in that situation: they rely on bringing the **on-screen** Simulator window to the front via AppleScript / `simctl`, which targets the Simulator instance on the **current** Space, not necessarily the one you are streaming.
 
 ## Private API / stability
 

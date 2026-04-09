@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-09
+
+### Added
+
+- **Select booted simulator (UDID)** — Command Palette command runs `xcrun simctl list devices booted -j`, lets you pick a booted device, and writes **User** setting `ios-simulator-embed.simulatorUdid` (or clear it). Same UDID flows to stream MAP / Indigo touch (`IOS_SIM_UDID`) and toolbar screenshot (`simctl io`).
+
+### Changed
+
+- **`simulatorUdid` description** — Documents the command and that an empty value defers to default booted-device behavior.
+- **Command titles** — **Start streamed panel** / **Stop streamed panel** (paired wording; command IDs unchanged).
+
+### Notes
+
+- **Spaces (Mission Control)** — Documented in README and stream panel hints: Simulator must share the editor’s desktop to **start** capture; after that, moving Simulator can leave stream/touch working while toolbar shortcuts may target the wrong Space.
+
 ## [1.0.0] - 2026-04-09
 
 First stable release for macOS.

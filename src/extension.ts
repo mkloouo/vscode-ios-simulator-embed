@@ -226,7 +226,8 @@ function panelHtml(webview: vscode.Webview): string {
     <div class="hint-body">
       MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD bottom-aligned in the capture. Disable for centered vertical fit.
       Debug: <code>debugMap</code>, <code>debugTouches</code>, <code>debugTouchPipeline</code>; command <strong>Touch / MAP debug checklist</strong>. Reopen the panel after MAP / pipeline env changes.
-      <code>simulatorUdid</code> if needed. Toolbar: Home (double-click quickly for app switcher), Screenshot, Rotate — host shortcuts via Simulator + Accessibility.
+      Command <strong>Select booted simulator (UDID)</strong> or <code>simulatorUdid</code> when several devices are booted. Toolbar: Home (double-click quickly for app switcher), Screenshot, Rotate — host shortcuts via Simulator + Accessibility.
+      <strong>Spaces:</strong> Simulator must be on the <strong>same desktop</strong> as the editor to <strong>start</strong> the stream; after it runs you can move Simulator elsewhere (stream/touch often keep working; toolbar buttons may not if Simulator is not on this Space).
     </div>
   </details>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
@@ -297,7 +298,11 @@ function panelHtml(webview: vscode.Webview): string {
             ? init.streamLayout.maxHeightPx + 'px'
             : 'auto';
         hintCompact.textContent =
-          'Stream max ' + w + ' × ' + h + ' (settings: streamMaxWidthPx, streamMaxHeightPx). Enable streamShowUsageHint for MAP/debug notes.';
+          'Stream max ' +
+          w +
+          ' × ' +
+          h +
+          ' (streamMaxWidthPx / streamMaxHeightPx). Same Space as the editor to start capture; toolbar needs Simulator on current Space. streamShowUsageHint for full notes.';
       }
     }
 
@@ -796,6 +801,120 @@ function simDeviceArg(): string {
   return u && u.length > 0 ? u : "booted";
 }
 
+type BootedSimDevice = { udid: string; name: string; runtimeLabel: string };
+
+function runtimeLabelFromSimctlKey(runtimeKey: string): string {
+  const m = runtimeKey.match(/SimRuntime\.iOS-(.+)$/);
+  if (!m) {
+    return runtimeKey.replace(/^com\.apple\.CoreSimulator\.SimRuntime\./, "");
+  }
+  return `iOS ${m[1].replace(/-/g, ".")}`;
+}
+
+/** Parses `xcrun simctl list devices booted -j`. */
+function listBootedSimulatorsFromSimctl(): BootedSimDevice[] | undefined {
+  try {
+    const out = cp.execFileSync("xcrun", ["simctl", "list", "devices", "booted", "-j"], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(out) as { devices?: Record<string, unknown> };
+    const bucket = parsed.devices;
+    if (!bucket || typeof bucket !== "object") {
+      return [];
+    }
+    const result: BootedSimDevice[] = [];
+    for (const [runtimeKey, arr] of Object.entries(bucket)) {
+      if (!Array.isArray(arr)) {
+        continue;
+      }
+      for (const row of arr) {
+        if (!row || typeof row !== "object") {
+          continue;
+        }
+        const r = row as Record<string, unknown>;
+        if (r.state !== "Booted") {
+          continue;
+        }
+        const udid = typeof r.udid === "string" ? r.udid.trim() : "";
+        const name = typeof r.name === "string" ? r.name.trim() : "";
+        if (!udid) {
+          continue;
+        }
+        result.push({
+          udid,
+          name: name.length > 0 ? name : "Simulator",
+          runtimeLabel: runtimeLabelFromSimctlKey(runtimeKey),
+        });
+      }
+    }
+    return result;
+  } catch {
+    return undefined;
+  }
+}
+
+type SimQuickPick = vscode.QuickPickItem & { udid?: string; clearSelection?: boolean };
+
+async function selectBootedSimulatorCommand() {
+  if (!isMacOSHost()) {
+    void vscode.window.showErrorMessage("Selecting a simulator requires macOS.");
+    return;
+  }
+  const list = listBootedSimulatorsFromSimctl();
+  if (list === undefined) {
+    void vscode.window.showErrorMessage(
+      "Could not list booted simulators (simctl failed). Install Xcode and ensure `xcrun simctl` works."
+    );
+    return;
+  }
+  if (list.length === 0) {
+    void vscode.window.showErrorMessage("No booted simulators. Boot a device in Xcode or Simulator, then try again.");
+    return;
+  }
+
+  const picks: SimQuickPick[] = [
+    {
+      label: "$(circle-slash) Clear saved UDID",
+      description: "Empty setting — helper / simctl choose among booted devices",
+      clearSelection: true,
+    },
+    ...list.map(
+      (d): SimQuickPick => ({
+        label: d.name,
+        description: d.udid,
+        detail: d.runtimeLabel,
+        udid: d.udid,
+      })
+    ),
+  ];
+
+  const sel = await vscode.window.showQuickPick(picks, {
+    title: "Booted simulator (stream MAP, touch, screenshot)",
+    placeHolder: "Updates User setting ios-simulator-embed.simulatorUdid",
+  });
+  if (!sel) {
+    return;
+  }
+
+  const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+  if (sel.clearSelection) {
+    await cfg.update("simulatorUdid", "", vscode.ConfigurationTarget.Global);
+    void vscode.window.showInformationMessage(
+      "Cleared simulator UDID. Reopen the streamed panel so stream/touch pick up the change."
+    );
+    return;
+  }
+  if (!sel.udid) {
+    return;
+  }
+  await cfg.update("simulatorUdid", sel.udid, vscode.ConfigurationTarget.Global);
+  const short = sel.udid.length > 12 ? `${sel.udid.slice(0, 8)}…` : sel.udid;
+  void vscode.window.showInformationMessage(
+    `Simulator UDID set (${sel.label}, ${short}). Reopen the streamed panel and start a new touch session.`
+  );
+}
+
 /** Bundle id of the app that is frontmost now (call before activating Simulator). */
 function getFrontmostAppBundleIdSync(): string | undefined {
   try {
@@ -981,7 +1100,9 @@ function runTouchMapDebugHelp() {
   debugOutputChannel.appendLine(
     "• ios-simulator-embed.debugTouchPipeline — OK:d|m|u from native HID session, gesture summary on release, throttle skip counts."
   );
-  debugOutputChannel.appendLine("• ios-simulator-embed.simulatorUdid — if multiple booted devices or wrong touch target.");
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.simulatorUdid — if multiple booted devices or wrong touch target; command “Select booted simulator (UDID)” sets this."
+  );
   debugOutputChannel.appendLine(
     "• ios-simulator-embed.targetBundleId — if the stream picks the wrong window (use List capture windows NDJSON)."
   );
@@ -1003,6 +1124,9 @@ function runTouchMapDebugHelp() {
   debugOutputChannel.appendLine("");
   debugOutputChannel.appendLine("Commands:");
   debugOutputChannel.appendLine("• iOS Simulator: List capture windows (debug) — NDJSON of ScreenCaptureKit shareable windows.");
+  debugOutputChannel.appendLine(
+    "• iOS Simulator: Select booted simulator (UDID) — writes User setting simulatorUdid from simctl booted list."
+  );
   debugOutputChannel.appendLine("");
   debugOutputChannel.appendLine("Gesture goals vs implementation:");
   debugOutputChannel.appendLine(
@@ -1016,6 +1140,9 @@ function runTouchMapDebugHelp() {
   );
   debugOutputChannel.appendLine(
     "• Toolbar (Home, Screenshot, Rotate) — host Automation: Home supports two quick clicks for app switcher; simctl screenshot via temp file; Rotate ⌘→; needs Accessibility for System Events."
+  );
+  debugOutputChannel.appendLine(
+    "• Spaces (Mission Control) — put Simulator on the same desktop as the editor to start the stream; after capture runs you can move Simulator (stream/touch often keep working; toolbar may target Simulator on the current Space only)."
   );
   debugOutputChannel.appendLine(
     "• Notification / Control Center drawers — edge pans from top/bottom; confirm MAP pads (debugMap) so y≈0 / y≈1 hit the bezel area."
@@ -1105,6 +1232,12 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.affectsConfiguration("ios-simulator-embed.streamJpegQuality")) {
         debugOutputChannel.appendLine(
           "[stream] `streamJpegQuality` changed — stop and reopen the streamed panel so the capture helper restarts with IOS_SIM_HELPER_JPEG_QUALITY."
+        );
+        debugOutputChannel.show(true);
+      }
+      if (e.affectsConfiguration("ios-simulator-embed.simulatorUdid")) {
+        debugOutputChannel.appendLine(
+          "[device] `simulatorUdid` changed — reopen the streamed panel for MAP/stream env; release pointer or reopen for a fresh touch session; screenshot uses the new UDID immediately."
         );
         debugOutputChannel.show(true);
       }
@@ -1249,6 +1382,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("ios-simulator-embed.debugHelp", () => {
       runTouchMapDebugHelp();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("ios-simulator-embed.selectSimulator", () => {
+      void selectBootedSimulatorCommand();
     })
   );
 }
