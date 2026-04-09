@@ -13,7 +13,8 @@
   "activationEvents": [
     "onCommand:ios-simulator-embed.openPanel",
     "onCommand:ios-simulator-embed.stopPanel",
-    "onCommand:ios-simulator-embed.listWindows"
+    "onCommand:ios-simulator-embed.listWindows",
+    "onCommand:ios-simulator-embed.debugHelp"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -29,6 +30,10 @@
       {
         "command": "ios-simulator-embed.listWindows",
         "title": "iOS Simulator: List capture windows (debug)"
+      },
+      {
+        "command": "ios-simulator-embed.debugHelp",
+        "title": "iOS Simulator: Touch / MAP debug checklist"
       }
     ],
     "configuration": {
@@ -49,6 +54,11 @@
           "type": "boolean",
           "default": false,
           "description": "Log each touch to the Output panel (iOS Simulator Embed) and show a small coordinate HUD in the stream webview."
+        },
+        "ios-simulator-embed.debugTouchPipeline": {
+          "type": "boolean",
+          "default": false,
+          "description": "Verbose touch pipeline: native helper echoes OK:d|m|u after each accepted HID send; extension logs throttled (skipped) moves and a one-line gesture summary on pointer up. Uses Output → “iOS Simulator Embed”. Start a new touch session after toggling (release pointer, or stop/reopen the stream panel)."
         },
         "ios-simulator-embed.debugMap": {
           "type": "boolean",

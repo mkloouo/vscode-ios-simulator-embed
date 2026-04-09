@@ -1,5 +1,6 @@
 import * as cp from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
@@ -17,6 +18,18 @@ let streamPads: StreamPads = { ...zeroPads };
 /** Tracks whether the webview has sent touch down (for move/up pairing). */
 let panelTouchActive = false;
 let panelTouchLastMoveMs = 0;
+
+/** Per-gesture stats for `debugTouchPipeline` summary (pointer down → up/cancel). */
+let touchGestureStartMs = 0;
+let touchGestureDownNx = 0;
+let touchGestureDownNy = 0;
+let touchGestureMovesSent = 0;
+let touchGestureMovesSkippedThrottle = 0;
+let touchGestureMaxDelta = 0;
+
+/** Two quick Home toolbar clicks → double ⌘⇧H in one Simulator activation (app switcher). */
+let homeChromeClickCount = 0;
+let homeChromeTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** One `ios-sim-helper touch sess` process so down/move/up share a single HID client (drags work). */
 let touchSessionChild: cp.ChildProcess | undefined;
@@ -41,6 +54,9 @@ function helperEnvForCapture(): NodeJS.ProcessEnv {
   }
   if (cfg.get<boolean>("mapStackVerticalLetterboxOnTop", true)) {
     env.IOS_SIM_HELPER_MAP_TOP_STACK = "1";
+  }
+  if (cfg.get<boolean>("debugTouchPipeline")) {
+    env.IOS_SIM_HELPER_TOUCH_DEBUG = "1";
   }
   return env;
 }
@@ -94,6 +110,10 @@ function stopTouchSession() {
   touchSessionChild = undefined;
   touchSessionStderrBuf = "";
   panelTouchActive = false;
+  touchGestureStartMs = 0;
+  touchGestureMovesSent = 0;
+  touchGestureMovesSkippedThrottle = 0;
+  touchGestureMaxDelta = 0;
 }
 
 function stopStream() {
@@ -139,9 +159,9 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD aligned to bottom of the capture. Disable for centered vertical fit. <code>debugMap</code> / <code>debugTouches</code>; reopen panel after MAP settings. <code>simulatorUdid</code> if needed.</div>
+  <div id="hint">Streamed Simulator. MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD aligned to bottom of the capture. Disable for centered vertical fit. Debug: <code>debugMap</code>, <code>debugTouches</code>, <code>debugTouchPipeline</code>, command <strong>Touch / MAP debug checklist</strong>; reopen panel after MAP / pipeline env changes. <code>simulatorUdid</code> if needed. Toolbar: Home, Screenshot, Rotate (host shortcuts via Simulator + Accessibility).</div>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
-    <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Briefly activates Simulator, then returns focus here.">
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Click twice within ~0.4s for app switcher (double home). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Home</span>
       <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
     </button>
@@ -538,6 +558,29 @@ function touchDebugEnabled(): boolean {
   return !!vscode.workspace.getConfiguration("ios-simulator-embed").get<boolean>("debugTouches");
 }
 
+function touchPipelineDebugEnabled(): boolean {
+  return !!vscode.workspace.getConfiguration("ios-simulator-embed").get<boolean>("debugTouchPipeline");
+}
+
+function resetTouchGestureForDown(hit: { nx: number; ny: number }) {
+  touchGestureStartMs = Date.now();
+  touchGestureDownNx = hit.nx;
+  touchGestureDownNy = hit.ny;
+  touchGestureMovesSent = 0;
+  touchGestureMovesSkippedThrottle = 0;
+  touchGestureMaxDelta = 0;
+}
+
+function touchRecordMoveSent(hit: { nx: number; ny: number }) {
+  touchGestureMovesSent += 1;
+  const dx = hit.nx - touchGestureDownNx;
+  const dy = hit.ny - touchGestureDownNy;
+  const d = Math.hypot(dx, dy);
+  if (d > touchGestureMaxDelta) {
+    touchGestureMaxDelta = d;
+  }
+}
+
 function logTouchDebug(
   phase: string,
   m: { x: number; y: number; w: number; h: number },
@@ -554,6 +597,36 @@ function logTouchDebug(
       `inImage (${x0.toFixed(4)}, ${y0.toFixed(4)})  MAP L,R,T,B (${padLeft.toFixed(4)}, ${padRight.toFixed(4)}, ${padTop.toFixed(4)}, ${padBottom.toFixed(4)})  ` +
       `→ device (${hit.nx.toFixed(6)}, ${hit.ny.toFixed(6)})`
   );
+}
+
+function logTouchGestureSummary(kind: "up" | "cancel") {
+  if (!touchPipelineDebugEnabled() || touchGestureStartMs <= 0) {
+    return;
+  }
+  const dur = Date.now() - touchGestureStartMs;
+  const sent = touchGestureMovesSent;
+  const skipped = touchGestureMovesSkippedThrottle;
+  let hint: string;
+  if (sent === 0) {
+    hint =
+      dur >= 450
+        ? "hold / long-press candidate (no moves; recognition delay is app-controlled)"
+        : "tap candidate";
+  } else {
+    hint =
+      touchGestureMaxDelta > 0.02
+        ? "drag / pan"
+        : "small motion (jitter or micro-drag)";
+  }
+  debugOutputChannel.appendLine(
+    `[gesture ${kind}] durationMs=${dur} movesSent=${sent} movesSkippedThrottle=${skipped} maxNormDelta≈${touchGestureMaxDelta.toFixed(5)} → ${hint}`
+  );
+  if (skipped > sent && sent > 0) {
+    debugOutputChannel.appendLine(
+      `[gesture ${kind}] note: pointermove is capped at ~60 Hz in the extension (16 ms); skipped events are expected for fast drags.`
+    );
+  }
+  debugOutputChannel.show(true);
 }
 
 function ensureTouchSession(bin: string, env: NodeJS.ProcessEnv): boolean {
@@ -573,9 +646,12 @@ function ensureTouchSession(bin: string, env: NodeJS.ProcessEnv): boolean {
         touchSessionStderrBuf = touchSessionStderrBuf.slice(nl + 1);
         if (line.startsWith("ERR:")) {
           debugOutputChannel.appendLine(`[touch session] ${line}`);
-          if (touchDebugEnabled()) {
+          if (touchDebugEnabled() || touchPipelineDebugEnabled()) {
             debugOutputChannel.show(true);
           }
+        } else if (line.startsWith("OK:") && touchPipelineDebugEnabled()) {
+          debugOutputChannel.appendLine(`[touch session] ${line}`);
+          debugOutputChannel.show(true);
         }
       }
     });
@@ -638,7 +714,7 @@ function runSimulatorHostShortcut(systemEventsCommand: string, errorLabel: strin
   ];
   if (previousBundleId) {
     const esc = previousBundleId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    args.push("-e", "delay 0.06");
+    args.push("-e", "delay 0.12");
     args.push("-e", `try\ntell application id "${esc}" to activate\nend try`);
   }
   cp.execFile("osascript", args, (err) => {
@@ -650,14 +726,77 @@ function runSimulatorHostShortcut(systemEventsCommand: string, errorLabel: strin
   });
 }
 
+function flushHomeChromeSchedule() {
+  if (homeChromeTimer !== undefined) {
+    clearTimeout(homeChromeTimer);
+    homeChromeTimer = undefined;
+  }
+  homeChromeClickCount = 0;
+}
+
+/**
+ * Sends one or two ⌘⇧H presses in a single Simulator foreground session (required for app switcher).
+ */
+function runSimulatorHomePresses(presses: 1 | 2) {
+  const previousBundleId = getFrontmostAppBundleIdSync();
+  const args: string[] = [
+    "-e",
+    'tell application "Simulator" to activate',
+    "-e",
+    "delay 0.2",
+  ];
+  for (let i = 0; i < presses; i++) {
+    args.push(
+      "-e",
+      'tell application "System Events" to keystroke "h" using {command down, shift down}'
+    );
+    if (i < presses - 1) {
+      args.push("-e", "delay 0.3");
+    }
+  }
+  args.push("-e", "delay 0.15");
+  if (previousBundleId) {
+    const esc = previousBundleId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    args.push("-e", `try\ntell application id "${esc}" to activate\nend try`);
+  }
+  const errLabel =
+    presses === 2
+      ? "Double home (app switcher) failed."
+      : "Hardware home (⌘⇧H) failed.";
+  cp.execFile("osascript", args, (err) => {
+    if (err) {
+      void vscode.window.showErrorMessage(
+        `${errLabel} Grant Accessibility to this app for “System Events”, or run the shortcut in Simulator. ${String(err)}`
+      );
+    }
+  });
+}
+
+/** Coalesce toolbar Home clicks: one click after idle → single home; two quick clicks → double home. */
+function scheduleSimulatorHomeToolbarClick() {
+  homeChromeClickCount += 1;
+  if (homeChromeTimer !== undefined) {
+    clearTimeout(homeChromeTimer);
+  }
+  const delay = homeChromeClickCount >= 2 ? 85 : 400;
+  homeChromeTimer = setTimeout(() => {
+    homeChromeTimer = undefined;
+    const presses = (homeChromeClickCount >= 2 ? 2 : 1) as 1 | 2;
+    homeChromeClickCount = 0;
+    runSimulatorHomePresses(presses);
+  }, delay);
+}
+
 async function runChromeAction(context: vscode.ExtensionContext, action: string) {
   switch (action) {
     case "screenshot": {
       const dev = simDeviceArg();
+      const tmp = path.join(os.tmpdir(), `ios-sim-embed-screenshot-${process.pid}-${Date.now()}.png`);
       try {
-        const png = cp.execFileSync("xcrun", ["simctl", "io", dev, "screenshot", "-", "--type=png"], {
+        cp.execFileSync("xcrun", ["simctl", "io", dev, "screenshot", tmp, "--type=png"], {
           maxBuffer: 32 * 1024 * 1024,
         });
+        const png = fs.readFileSync(tmp);
         const name = `simulator-screenshot-${Date.now()}.png`;
         const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
         const target = folder
@@ -683,14 +822,17 @@ async function runChromeAction(context: vscode.ExtensionContext, action: string)
         }
       } catch (e) {
         void vscode.window.showErrorMessage(`simctl screenshot failed: ${String(e)}`);
+      } finally {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* temp may be missing if simctl failed before creating it */
+        }
       }
       break;
     }
     case "home": {
-      runSimulatorHostShortcut(
-        'keystroke "h" using {command down, shift down}',
-        "Hardware home (⌘⇧H) failed."
-      );
+      scheduleSimulatorHomeToolbarClick();
       break;
     }
     case "rotate": {
@@ -703,6 +845,56 @@ async function runChromeAction(context: vscode.ExtensionContext, action: string)
     default:
       break;
   }
+}
+
+function runTouchMapDebugHelp() {
+  debugOutputChannel.clear();
+  debugOutputChannel.appendLine("=== iOS Simulator Embed — debug checklist ===");
+  debugOutputChannel.appendLine("");
+  debugOutputChannel.appendLine("Output panel: View → Output → channel “iOS Simulator Embed”.");
+  debugOutputChannel.appendLine("");
+  debugOutputChannel.appendLine("Settings (Workspace / User):");
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.debugMap — MAP letterbox, BOUNDS, MAP_SKIP / MAP_DEBUG from stream helper. Reopen streamed panel after toggle."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.debugTouches — coordinates per down/move/up + HUD on the stream image."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.debugTouchPipeline — OK:d|m|u from native HID session, gesture summary on release, throttle skip counts."
+  );
+  debugOutputChannel.appendLine("• ios-simulator-embed.simulatorUdid — if multiple booted devices or wrong touch target.");
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.targetBundleId — if the stream picks the wrong window (use List capture windows NDJSON)."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.mapStackVerticalLetterboxOnTop — vertical letterbox above LCD vs centered fit."
+  );
+  debugOutputChannel.appendLine("");
+  debugOutputChannel.appendLine("Commands:");
+  debugOutputChannel.appendLine("• iOS Simulator: List capture windows (debug) — NDJSON of ScreenCaptureKit shareable windows.");
+  debugOutputChannel.appendLine("");
+  debugOutputChannel.appendLine("Gesture goals vs implementation:");
+  debugOutputChannel.appendLine(
+    "• Tap — down + up at same spot; use debugTouches to confirm nx,ny and no stray moves (jitter can cancel long-press)."
+  );
+  debugOutputChannel.appendLine(
+    "• Long press — hold without moving; duration until the menu appears is defined by the app / iOS, not the extension."
+  );
+  debugOutputChannel.appendLine(
+    "• Drag — down, many moves (see OK:m vs ERR:), up; pipeline summary shows movesSent and maxNormDelta."
+  );
+  debugOutputChannel.appendLine(
+    "• Toolbar (Home, Screenshot, Rotate) — host Automation: Home supports two quick clicks for app switcher; simctl screenshot via temp file; Rotate ⌘→; needs Accessibility for System Events."
+  );
+  debugOutputChannel.appendLine(
+    "• Notification / Control Center drawers — edge pans from top/bottom; confirm MAP pads (debugMap) so y≈0 / y≈1 hit the bezel area."
+  );
+  debugOutputChannel.appendLine("");
+  debugOutputChannel.appendLine(
+    "If OK:m lines are missing but ERR: repeats on move, SimulatorKit may not be building Indigo drag messages on your Xcode version — compare with a known-good simulator OS."
+  );
+  debugOutputChannel.show(true);
 }
 
 function runListWindowsDebug(context: vscode.ExtensionContext) {
@@ -773,6 +965,12 @@ export function activate(context: vscode.ExtensionContext) {
         if (mapDebugEnabled()) {
           debugOutputChannel.show(true);
         }
+      }
+      if (e.affectsConfiguration("ios-simulator-embed.debugTouchPipeline")) {
+        debugOutputChannel.appendLine(
+          "[touch] `debugTouchPipeline` changed — next touch starts a new session with IOS_SIM_HELPER_TOUCH_DEBUG; or stop/reopen the stream panel."
+        );
+        debugOutputChannel.show(true);
       }
     })
   );
@@ -849,6 +1047,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
             panelTouchActive = true;
             panelTouchLastMoveMs = 0;
+            resetTouchGestureForDown(hit);
             logTouchDebug("down", coords, hit);
             sendTouchSessionLine(`d ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
             return;
@@ -856,9 +1055,11 @@ export function activate(context: vscode.ExtensionContext) {
           if (m.type === "touchMove" && panelTouchActive) {
             const now = Date.now();
             if (now - panelTouchLastMoveMs < 16) {
+              touchGestureMovesSkippedThrottle += 1;
               return;
             }
             panelTouchLastMoveMs = now;
+            touchRecordMoveSent(hit);
             logTouchDebug("move", coords, hit);
             sendTouchSessionLine(`m ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
             return;
@@ -866,6 +1067,7 @@ export function activate(context: vscode.ExtensionContext) {
           if ((m.type === "touchUp" || m.type === "touchCancel") && panelTouchActive) {
             panelTouchActive = false;
             logTouchDebug(m.type === "touchUp" ? "up" : "cancel", coords, hit);
+            logTouchGestureSummary(m.type === "touchUp" ? "up" : "cancel");
             sendTouchSessionLine(`u ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
           }
         },
@@ -895,8 +1097,15 @@ export function activate(context: vscode.ExtensionContext) {
       runListWindowsDebug(context);
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("ios-simulator-embed.debugHelp", () => {
+      runTouchMapDebugHelp();
+    })
+  );
 }
 
 export function deactivate() {
+  flushHomeChromeSchedule();
   stopStream();
 }
