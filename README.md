@@ -65,6 +65,10 @@ Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator u
 - `touch tap <nx> <ny>` — Indigo tap; `nx`,`ny` in `[0,1]` from top-left of the simulated display. Env `IOS_SIM_UDID` optional.
 - `list` — NDJSON of shareable macOS windows (debug bundle IDs for streaming).
 
+## Extension icon
+
+The Visual Studio Marketplace expects a **128×128 PNG** referenced by `package.json` as [`images/icon.png`](images/icon.png). The higher-resolution square source lives at [`images/icon-source.png`](images/icon-source.png) (re-export with `sips -z 128 128 images/icon-source.png --out images/icon.png` after edits).
+
 ## License
 
 Copyright 2026 Mykola Odnosumov. Licensed under the **Apache License 2.0** (see [`LICENSE`](LICENSE)). Portions of the native helper are derived from Meta [idb](https://github.com/facebook/idb) (MIT); see [`native/ios-sim-helper/THIRD_PARTY.md`](native/ios-sim-helper/THIRD_PARTY.md).
