@@ -1,0 +1,41 @@
+{
+  "name": "ios-simulator-embed",
+  "displayName": "iOS Simulator (streamed panel)",
+  "description": "Stream the iOS Simulator into a VS Code webview and forward pointer input (macOS, ScreenCaptureKit).",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:ios-simulator-embed.openPanel",
+    "onCommand:ios-simulator-embed.stopPanel"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ios-simulator-embed.openPanel",
+        "title": "iOS Simulator: Open streamed panel"
+      },
+      {
+        "command": "ios-simulator-embed.stopPanel",
+        "title": "iOS Simulator: Stop stream"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build:native": "cd native/ios-sim-helper && swift build -c release"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}

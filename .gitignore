@@ -1,0 +1,5 @@
+node_modules
+out
+*.vsix
+.DS_Store
+native/ios-sim-helper/.build

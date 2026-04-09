@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "npm: compile",
+      "type": "npm",
+      "script": "compile",
+      "problemMatcher": "$tsc",
+      "group": "build"
+    },
+    {
+      "label": "swift: release",
+      "type": "shell",
+      "command": "swift build -c release",
+      "options": { "cwd": "${workspaceFolder}/native/ios-sim-helper" },
+      "problemMatcher": []
+    }
+  ]
+}
