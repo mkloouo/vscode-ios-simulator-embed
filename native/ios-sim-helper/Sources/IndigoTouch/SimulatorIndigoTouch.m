@@ -57,21 +57,44 @@ static IndigoMessage *BuildTouchMessage(IndigoTouch *payload, size_t *messageSiz
   return message;
 }
 
-// NSEventType (AppKit): LeftMouseDown=1, LeftMouseUp=2, LeftMouseDragged=6.
-// Phase 0 means "touch move during drag" — passing 0 to IndigoHIDMessageForMouseNSEvent returns NULL (invalid type).
-static const int kNSEventLeftMouseDragged = 6;
+// NSEventType (AppKit): LeftMouseDown=1, LeftMouseUp=2, MouseMoved=5, LeftMouseDragged=6,
+// RightMouseDragged=7, OtherMouseDragged=8. Phase 0 is "touch move" — never pass 0 as event type.
 static const int kNSEventMouseMoved = 5;
+static const int kNSEventLeftMouseDragged = 6;
+static const int kNSEventRightMouseDragged = 7;
+static const int kNSEventOtherMouseDragged = 8;
+
+static IndigoMessage *BuildTouchMoveAtRatios(double xRatio, double yRatio, size_t *outSize) {
+  static const int kMoveTypes[] = {
+    kNSEventLeftMouseDragged,
+    kNSEventMouseMoved,
+    kNSEventRightMouseDragged,
+    kNSEventOtherMouseDragged,
+  };
+  CGPoint point = CGPointMake(xRatio, yRatio);
+  for (size_t ti = 0; ti < sizeof(kMoveTypes) / sizeof(kMoveTypes[0]); ti++) {
+    for (int lastPass = 0; lastPass <= 1; lastPass++) {
+      BOOL lastFlag = lastPass ? YES : NO;
+      IndigoMessage *partial =
+        IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, kMoveTypes[ti], lastFlag);
+      if (partial) {
+        partial->payload.event.touch.xRatio = xRatio;
+        partial->payload.event.touch.yRatio = yRatio;
+        IndigoTouch t = partial->payload.event.touch;
+        free(partial);
+        return BuildTouchMessage(&t, outSize);
+      }
+    }
+  }
+  return NULL;
+}
 
 static IndigoMessage *BuildTouchAtRatios(double xRatio, double yRatio, int direction, size_t *outSize) {
-  CGPoint point = CGPointMake(xRatio, yRatio);
-  int mouseType = direction;
   if (direction == 0) {
-    mouseType = kNSEventLeftMouseDragged;
+    return BuildTouchMoveAtRatios(xRatio, yRatio, outSize);
   }
-  IndigoMessage *partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, mouseType, NO);
-  if (!partial && direction == 0) {
-    partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, kNSEventMouseMoved, NO);
-  }
+  CGPoint point = CGPointMake(xRatio, yRatio);
+  IndigoMessage *partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, direction, NO);
   if (!partial) {
     return NULL;
   }
@@ -195,20 +218,13 @@ static Class SimDeviceLegacyHIDClientClass(void) {
   return objc_lookUpClass("SimDeviceLegacyHIDClient");
 }
 
-static BOOL HIDClientSendIndigoTouch(id client, double xRatio, double yRatio, int phase, char *errBuf, size_t errLen) {
-  if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
-    StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
-    return NO;
-  }
-  if (phase != 0 && phase != 1 && phase != 2) {
-    StrErr(errBuf, errLen, @"phase must be 0 (move), 1 (down), or 2 (up)");
-    return NO;
-  }
-
-  size_t msgSize = 0;
-  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, phase, &msgSize);
-  if (!message || msgSize == 0) {
-    StrErr(errBuf, errLen, @"IndigoHIDMessageForMouseNSEvent unavailable or allocation failed");
+static BOOL HIDClientSendIndigoMessage(
+  id client,
+  IndigoMessage *message,
+  char *errBuf,
+  size_t errLen) {
+  if (!message) {
+    StrErr(errBuf, errLen, @"Indigo message is null");
     return NO;
   }
 
@@ -237,6 +253,26 @@ static BOOL HIDClientSendIndigoTouch(id client, double xRatio, double yRatio, in
     return NO;
   }
   return YES;
+}
+
+static BOOL HIDClientSendIndigoTouch(id client, double xRatio, double yRatio, int phase, char *errBuf, size_t errLen) {
+  if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
+    StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
+    return NO;
+  }
+  if (phase != 0 && phase != 1 && phase != 2) {
+    StrErr(errBuf, errLen, @"phase must be 0 (move), 1 (down), or 2 (up)");
+    return NO;
+  }
+
+  size_t msgSize = 0;
+  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, phase, &msgSize);
+  if (!message || msgSize == 0) {
+    StrErr(errBuf, errLen, @"IndigoHIDMessageForMouseNSEvent unavailable or allocation failed");
+    return NO;
+  }
+
+  return HIDClientSendIndigoMessage(client, message, errBuf, errLen);
 }
 
 BOOL IOSEmbedBootedMainScreenLogicalSize(
