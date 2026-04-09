@@ -57,9 +57,21 @@ static IndigoMessage *BuildTouchMessage(IndigoTouch *payload, size_t *messageSiz
   return message;
 }
 
+// NSEventType (AppKit): LeftMouseDown=1, LeftMouseUp=2, LeftMouseDragged=6.
+// Phase 0 means "touch move during drag" — passing 0 to IndigoHIDMessageForMouseNSEvent returns NULL (invalid type).
+static const int kNSEventLeftMouseDragged = 6;
+static const int kNSEventMouseMoved = 5;
+
 static IndigoMessage *BuildTouchAtRatios(double xRatio, double yRatio, int direction, size_t *outSize) {
   CGPoint point = CGPointMake(xRatio, yRatio);
-  IndigoMessage *partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, direction, NO);
+  int mouseType = direction;
+  if (direction == 0) {
+    mouseType = kNSEventLeftMouseDragged;
+  }
+  IndigoMessage *partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, mouseType, NO);
+  if (!partial && direction == 0) {
+    partial = IndigoHIDMessageForMouseNSEvent(&point, NULL, 0x32, kNSEventMouseMoved, NO);
+  }
   if (!partial) {
     return NULL;
   }

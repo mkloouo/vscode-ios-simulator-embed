@@ -203,7 +203,7 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
 
 // MARK: - Indigo HID touch (private SimulatorKit SPI)
 
-/// `phase`: 1 = down, 2 = up, 0 = move (drag) update.
+/// `phase`: 1 = down, 2 = up, 0 = move (mapped to NSEvent left-mouse-dragged in native code).
 private func hidSendPhase(normX: Double, normY: Double, phase: Int32) -> String? {
   var err = [CChar](repeating: 0, count: 512)
   guard IOSEmbedLoadSimulatorFrameworks() else {

@@ -108,10 +108,12 @@ function panelHtml(webview: vscode.Webview): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     body { margin: 0; padding: 8px; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-font-family); }
-    #chromeBar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent); border-radius: 6px; max-width: 100%; box-sizing: border-box; }
-    #chromeBar .chromeTitle { flex: 1 1 auto; font-size: 12px; opacity: 0.85; min-width: 120px; }
-    .chromeBtn { font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; border-radius: 4px; border: 1px solid color-mix(in srgb, var(--vscode-editor-foreground) 25%, transparent); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    #chromeBar { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; padding: 6px 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent); border-radius: 6px; max-width: 100%; box-sizing: border-box; }
+    .chromeBtn { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid color-mix(in srgb, var(--vscode-editor-foreground) 25%, transparent); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
     .chromeBtn:hover { filter: brightness(1.08); }
+    .chromeIconBtn { padding: 8px; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+    .chromeIconBtn svg { display: block; flex-shrink: 0; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     #wrap { position: relative; display: inline-block; max-width: 100%; }
     #frame { display: block; max-width: 100%; height: auto; cursor: pointer; user-select: none; touch-action: none; background: #111; }
     #hint { font-size: 12px; opacity: 0.75; margin-bottom: 8px; line-height: 1.35; }
@@ -120,12 +122,20 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. Drag to scroll uses one HID session. <strong>Chrome row</strong>: Home / Screenshot / Rotate (screenshot uses <code>simctl</code>; Home/Rotate briefly activate Simulator and need Accessibility for System Events). Enable <code>debugTouches</code> for coordinate logging. Set UDID if multiple simulators are booted.</div>
+  <div id="hint">Streamed Simulator. Drag to scroll uses one HID session. Toolbar icons: home, screenshot (<code>simctl</code>), rotate — Home/Rotate use Simulator + Accessibility. Enable <code>debugTouches</code> for coordinates. Set <code>simulatorUdid</code> if MAP stays zero or touches target the wrong device.</div>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
-    <span class="chromeTitle">Simulator chrome</span>
-    <button type="button" class="chromeBtn" data-action="home" title="Hardware home (⌘⇧H). Activates Simulator.app.">Home</button>
-    <button type="button" class="chromeBtn" data-action="screenshot" title="Save device screenshot via simctl (not the streamed JPEG).">Screenshot</button>
-    <button type="button" class="chromeBtn" data-action="rotate" title="Rotate right (⌘→). Activates Simulator.app.">Rotate</button>
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Activates Simulator.app.">
+      <span class="sr-only">Home</span>
+      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+    </button>
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="screenshot" title="Save device screenshot via simctl (device framebuffer, not this stream).">
+      <span class="sr-only">Screenshot</span>
+      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+    </button>
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="rotate" title="Rotate right (⌘→). Activates Simulator.app.">
+      <span class="sr-only">Rotate</span>
+      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1 2.12-9.36L23 10"/></svg>
+    </button>
   </div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
