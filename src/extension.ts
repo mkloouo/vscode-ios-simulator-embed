@@ -249,6 +249,32 @@ function panelHtml(webview: vscode.Webview): string {
       return { x, y, w: r.width, h: r.height, nw: img.naturalWidth, nh: img.naturalHeight };
     }
 
+    /** Same as display rect but clamps to image edges (pointer left the bitmap but we still need a sample). */
+    function relCoordsClamped(ev) {
+      const r = img.getBoundingClientRect();
+      if (!img.naturalWidth || !img.naturalHeight) return null;
+      let x = ev.clientX - r.left;
+      let y = ev.clientY - r.top;
+      x = Math.max(0, Math.min(r.width, x));
+      y = Math.max(0, Math.min(r.height, y));
+      return { x, y, w: r.width, h: r.height, nw: img.naturalWidth, nh: img.naturalHeight };
+    }
+
+    let lastTouchSample = null;
+
+    function finishActivePointer(kind) {
+      if (activePointer === null) return;
+      const pid = activePointer;
+      activePointer = null;
+      try { img.releasePointerCapture(pid); } catch (_) {}
+      const p = lastTouchSample;
+      if (p && p.nw && p.nh) {
+        updateDebugHud(kind, p);
+        vscode.postMessage({ type: kind, ...p, button: 0 });
+      }
+      lastTouchSample = null;
+    }
+
     img.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       ev.preventDefault();
@@ -256,31 +282,59 @@ function panelHtml(webview: vscode.Webview): string {
       if (!p || !p.nw || !p.nh) return;
       try { img.setPointerCapture(ev.pointerId); } catch (_) {}
       activePointer = ev.pointerId;
+      lastTouchSample = p;
       updateDebugHud('down', p);
       vscode.postMessage({ type: 'touchDown', ...p, button: ev.button });
     });
 
     img.addEventListener('pointermove', (ev) => {
       if (activePointer === null || ev.pointerId !== activePointer) return;
-      const p = relCoords(ev);
+      let p = relCoords(ev);
+      if (!p) {
+        p = relCoordsClamped(ev);
+      }
       if (!p) return;
+      lastTouchSample = p;
       updateDebugHud('move', p);
       vscode.postMessage({ type: 'touchMove', ...p });
     });
 
-    function endPointer(ev, kind) {
-      if (activePointer === null || ev.pointerId !== activePointer) return;
-      const p = relCoords(ev);
-      if (p) {
-        updateDebugHud(kind, p);
-        vscode.postMessage({ type: kind, ...p, button: ev.button });
+    img.addEventListener('pointerup', (ev) => {
+      if (ev.pointerId === activePointer) {
+        finishActivePointer('touchUp');
       }
-      try { img.releasePointerCapture(ev.pointerId); } catch (_) {}
-      activePointer = null;
-    }
+    });
+    img.addEventListener('pointercancel', (ev) => {
+      if (ev.pointerId === activePointer) {
+        finishActivePointer('touchCancel');
+      }
+    });
 
-    img.addEventListener('pointerup', (ev) => endPointer(ev, 'touchUp'));
-    img.addEventListener('pointercancel', (ev) => endPointer(ev, 'touchCancel'));
+    img.addEventListener('lostpointercapture', (ev) => {
+      if (ev.pointerId === activePointer) {
+        finishActivePointer('touchCancel');
+      }
+    });
+
+    window.addEventListener(
+      'pointerup',
+      (ev) => {
+        if (ev.pointerId === activePointer) {
+          finishActivePointer('touchUp');
+        }
+      },
+      true
+    );
+    window.addEventListener(
+      'pointercancel',
+      (ev) => {
+        if (ev.pointerId === activePointer) {
+          finishActivePointer('touchCancel');
+        }
+      },
+      true
+    );
+    window.addEventListener('blur', () => finishActivePointer('touchCancel'));
 
     vscode.postMessage({ type: 'panelReady' });
   </script>
@@ -350,10 +404,13 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
       try {
         const raw = JSON.parse(s.slice(4)) as Record<string, unknown>;
         const n = (k: string) => (typeof raw[k] === "number" ? (raw[k] as number) : Number.NaN);
-        const padLeft = n("padLeft");
-        const padRight = n("padRight");
-        const padTop = n("padTop");
-        const padBottom = n("padBottom");
+        /** Float noise from the helper can be slightly negative; clamp to [0,1). */
+        const sanitizePad = (v: number) =>
+          Number.isFinite(v) ? Math.max(0, Math.min(0.999999, v)) : Number.NaN;
+        const padLeft = sanitizePad(n("padLeft"));
+        const padRight = sanitizePad(n("padRight"));
+        const padTop = sanitizePad(n("padTop"));
+        const padBottom = sanitizePad(n("padBottom"));
         const finite = [padLeft, padRight, padTop, padBottom].every((v) => Number.isFinite(v));
         const rangeOk = [padLeft, padRight, padTop, padBottom].every((v) => v >= 0 && v < 1);
         const capOk = [padLeft, padRight, padTop, padBottom].every((v) => v <= 0.49);

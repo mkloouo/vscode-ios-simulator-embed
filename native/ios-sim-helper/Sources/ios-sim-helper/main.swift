@@ -364,11 +364,25 @@ private func mapInsetsForDeviceInWindow(
   let fittedH = deviceHeight * scale
   let ox = (w - fittedW) / 2
   let oy = (h - fittedH) / 2
-  let padLeft = ox / w
-  let padRight = (w - ox - fittedW) / w
-  let padTop = oy / h
-  let padBottom = (h - oy - fittedH) / h
+  // Clamp to [0,1): float noise can yield tiny negative L/R when the fit is symmetric.
+  func clampPad(_ v: Double) -> Double { min(max(v, 0), 0.999999) }
+  let padLeft = clampPad(ox / w)
+  let padRight = clampPad((w - ox - fittedW) / w)
+  let padTop = clampPad(oy / h)
+  let padBottom = clampPad((h - oy - fittedH) / h)
   return (padLeft, padRight, padTop, padBottom)
+}
+
+private func framesDiffer(_ a: CGRect, _ b: CGRect, epsilon: CGFloat = 0.5) -> Bool {
+  abs(a.origin.x - b.origin.x) > epsilon || abs(a.origin.y - b.origin.y) > epsilon
+    || abs(a.width - b.width) > epsilon || abs(a.height - b.height) > epsilon
+}
+
+/// Same `SCWindow` as when streaming started (by `windowID`), if still present.
+@MainActor
+private func scWindowById(_ windowID: CGWindowID) async throws -> SCWindow? {
+  let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+  return content.windows.first { UInt32($0.windowID) == windowID }
 }
 
 // MARK: - ScreenCaptureKit delegate
@@ -398,20 +412,10 @@ final class StreamOutput: NSObject, SCStreamOutput {
 
 // MARK: - Stream mode (wire protocol: stderr BOUNDS, stdout length + JPEG)
 
-/// Configures and runs capture until stdin closes (parent process kill/dispose).
-///
-/// Protocol for the Node extension:
-///   1. One line on stderr: `BOUNDS:{...}\n` with window frame in Cocoa global coordinates (points).
-///   2. Optional: `MAP:{"padLeft","padRight","padTop","padBottom"}\n` — letterbox of the device LCD inside
-///      the captured window (fractions of window width/height). The webview maps clicks through this inset
-///      before sending normalized Indigo coordinates.
-///   3. Repeated on stdout: 4-byte big-endian length + JPEG bytes (no delimiters otherwise).
+/// Writes `BOUNDS:` and `MAP:` / `MAP_SKIP` / `MAP_DEBUG` for the current Simulator window frame (points).
+/// Called at stream start and periodically when the window is resized so the extension can refresh insets.
 @MainActor
-private func runStream() async throws {
-  let window = try await findSimulatorWindow()
-  let frame = window.frame
-  let scale = backingScale(for: frame)
-  // `SCWindow.frame` is in **points** (Cocoa global); same space as `NSEvent.mouseLocation` / `CGEvent`.
+private func emitBoundsAndMap(for frame: CGRect) throws {
   let boundsPayload: [String: Double] = [
     "x": Double(frame.origin.x),
     "y": Double(frame.origin.y),
@@ -419,7 +423,9 @@ private func runStream() async throws {
     "height": Double(frame.height),
   ]
   let json = try JSONSerialization.data(withJSONObject: boundsPayload, options: [])
-  guard let line = String(data: json, encoding: .utf8) else { throw HelperError.streamFailed("bounds encode") }
+  guard let line = String(data: json, encoding: .utf8) else {
+    throw HelperError.streamFailed("bounds encode")
+  }
   FileHandle.standardError.write(Data("BOUNDS:\(line)\n".utf8))
 
   var errMap = [CChar](repeating: 0, count: 512)
@@ -504,6 +510,27 @@ private func runStream() async throws {
         ])
     }
   }
+}
+
+/// Configures and runs capture until stdin closes (parent process kill/dispose).
+///
+/// Protocol for the Node extension:
+///   1. One line on stderr: `BOUNDS:{...}\n` with window frame in Cocoa global coordinates (points).
+///   2. Optional: `MAP:{"padLeft","padRight","padTop","padBottom"}\n` — letterbox of the device LCD inside
+///      the captured window (fractions of window width/height). The webview maps clicks through this inset
+///      before sending normalized Indigo coordinates.
+///   3. Repeated on stdout: 4-byte big-endian length + JPEG bytes (no delimiters otherwise).
+///
+///   While streaming, the helper polls the same `windowID` every 500ms and may emit additional
+///   `BOUNDS:` / `MAP:` lines when the Simulator window frame changes (resize / move). The extension
+///   should apply the latest MAP. Video dimensions are fixed at capture start until the stream restarts.
+@MainActor
+private func runStream() async throws {
+  let window = try await findSimulatorWindow()
+  let captureWindowID = window.windowID
+  let frame = window.frame
+  let scale = backingScale(for: frame)
+  try emitBoundsAndMap(for: frame)
 
   // Capture only this window (not the whole display).
   let filter = SCContentFilter(desktopIndependentWindow: window)
@@ -533,6 +560,19 @@ private func runStream() async throws {
   try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue.global(qos: .userInitiated))
   try await stream.startCapture()
 
+  var lastPolledFrame = frame
+  let mapPoll = Task { @MainActor in
+    while !Task.isCancelled {
+      try? await Task.sleep(nanoseconds: 500_000_000)
+      guard let w = try? await scWindowById(captureWindowID) else { continue }
+      let f = w.frame
+      if framesDiffer(f, lastPolledFrame) {
+        lastPolledFrame = f
+        try? emitBoundsAndMap(for: f)
+      }
+    }
+  }
+
   // Block until stdin is closed (extension disposes the child or closes the pipe).
   // `withCheckedContinuation` bridges callback-style async APIs into Swift `async`.
   await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -542,6 +582,7 @@ private func runStream() async throws {
     }
   }
 
+  mapPoll.cancel()
   try await stream.stopCapture()
 }
 
