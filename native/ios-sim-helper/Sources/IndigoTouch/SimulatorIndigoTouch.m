@@ -183,19 +183,56 @@ static Class SimDeviceLegacyHIDClientClass(void) {
   return objc_lookUpClass("SimDeviceLegacyHIDClient");
 }
 
+BOOL IOSEmbedBootedMainScreenLogicalSize(
+  NSString *udidFilter,
+  double *outW,
+  double *outH,
+  char *errBuf,
+  size_t errLen) {
+  if (!outW || !outH) {
+    return NO;
+  }
+  *outW = 0;
+  *outH = 0;
+  if (!IOSEmbedLoadSimulatorFrameworks()) {
+    StrErr(errBuf, errLen, @"Failed to load CoreSimulator / SimulatorKit");
+    return NO;
+  }
+  NSError *err = nil;
+  id device = BootedSimDevice(udidFilter, &err);
+  if (!device) {
+    StrErr(errBuf, errLen, err.localizedDescription);
+    return NO;
+  }
+  id deviceType = ((id (*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
+  if (!deviceType) {
+    StrErr(errBuf, errLen, @"SimDevice deviceType is nil");
+    return NO;
+  }
+  CGSize (*getMainScreenSize)(id, SEL) = (CGSize (*)(id, SEL))objc_msgSend;
+  CGSize sz = getMainScreenSize(deviceType, sel_registerName("mainScreenSize"));
+  if (sz.width <= 0 || sz.height <= 0) {
+    StrErr(errBuf, errLen, @"mainScreenSize is invalid");
+    return NO;
+  }
+  *outW = sz.width;
+  *outH = sz.height;
+  return YES;
+}
+
 BOOL IOSEmbedHIDSendTouch(
   NSString *udid,
   double xRatio,
   double yRatio,
-  int direction,
+  int phase,
   char *errBuf,
   size_t errLen) {
   if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
     StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
     return NO;
   }
-  if (direction != 1 && direction != 2) {
-    StrErr(errBuf, errLen, @"direction must be 1 (down) or 2 (up)");
+  if (phase != 0 && phase != 1 && phase != 2) {
+    StrErr(errBuf, errLen, @"phase must be 0 (move), 1 (down), or 2 (up)");
     return NO;
   }
 
@@ -221,7 +258,7 @@ BOOL IOSEmbedHIDSendTouch(
   }
 
   size_t msgSize = 0;
-  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, direction, &msgSize);
+  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, phase, &msgSize);
   if (!message || msgSize == 0) {
     StrErr(errBuf, errLen, @"IndigoHIDMessageForMouseNSEvent unavailable or allocation failed");
     return NO;

@@ -8,6 +8,16 @@ let activePanel: vscode.WebviewPanel | undefined;
 let streamProcess: cp.ChildProcessWithoutNullStreams | undefined;
 let lastFramePostedAt = 0;
 
+/** Letterbox of the device LCD inside the streamed window (fractions of window w/h); from helper `MAP:` line. */
+type StreamPads = { padLeft: number; padRight: number; padTop: number; padBottom: number };
+
+const zeroPads: StreamPads = { padLeft: 0, padRight: 0, padTop: 0, padBottom: 0 };
+let streamPads: StreamPads = { ...zeroPads };
+
+/** Tracks whether the webview has sent touch down (for move/up pairing). */
+let panelTouchActive = false;
+let panelTouchLastMoveMs = 0;
+
 const debugOutputChannel = vscode.window.createOutputChannel("iOS Simulator Embed");
 
 /** Merged env for stream / Indigo touch (bundle id + optional booted UDID). */
@@ -77,17 +87,18 @@ function panelHtml(webview: vscode.Webview): string {
     body { margin: 0; padding: 8px; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-font-family); }
     #wrap { position: relative; display: inline-block; max-width: 100%; }
     #frame { display: block; max-width: 100%; height: auto; cursor: pointer; user-select: none; touch-action: none; background: #111; }
-    #hint { font-size: 12px; opacity: 0.75; margin-bottom: 8px; }
+    #hint { font-size: 12px; opacity: 0.75; margin-bottom: 8px; line-height: 1.35; }
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator (Screen Recording). Left-click sends Indigo HID taps (normalized to the image); works when the Simulator window is behind other apps. Set simulator UDID if multiple booted.</div>
+  <div id="hint">Streamed Simulator. Pointer: tap (press/release), drag to scroll, hold for press-and-hold. Coordinates use the device screen inset inside the window. Set simulator UDID if multiple booted.</div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
   </div>
   <script nonce="streampanel">
     const vscode = acquireVsCodeApi();
     const img = document.getElementById('frame');
+    let activePointer = null;
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
@@ -105,11 +116,34 @@ function panelHtml(webview: vscode.Webview): string {
     }
 
     img.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return;
       ev.preventDefault();
       const p = relCoords(ev);
       if (!p || !p.nw || !p.nh) return;
-      vscode.postMessage({ type: 'pointerDown', ...p, button: ev.button });
+      try { img.setPointerCapture(ev.pointerId); } catch (_) {}
+      activePointer = ev.pointerId;
+      vscode.postMessage({ type: 'touchDown', ...p, button: ev.button });
     });
+
+    img.addEventListener('pointermove', (ev) => {
+      if (activePointer === null || ev.pointerId !== activePointer) return;
+      const p = relCoords(ev);
+      if (!p) return;
+      vscode.postMessage({ type: 'touchMove', ...p });
+    });
+
+    function endPointer(ev, kind) {
+      if (activePointer === null || ev.pointerId !== activePointer) return;
+      const p = relCoords(ev);
+      if (p) {
+        vscode.postMessage({ type: kind, ...p, button: ev.button });
+      }
+      try { img.releasePointerCapture(ev.pointerId); } catch (_) {}
+      activePointer = null;
+    }
+
+    img.addEventListener('pointerup', (ev) => endPointer(ev, 'touchUp'));
+    img.addEventListener('pointercancel', (ev) => endPointer(ev, 'touchCancel'));
   </script>
 </body>
 </html>`;
@@ -123,6 +157,9 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
 
   stopStream();
   lastFramePostedAt = 0;
+  streamPads = { ...zeroPads };
+  panelTouchActive = false;
+  panelTouchLastMoveMs = 0;
 
   const child = cp.spawn(bin, ["stream"], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -132,7 +169,30 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
 
   const rl = readline.createInterface({ input: child.stderr });
   rl.on("line", (line) => {
-    if (line.startsWith("BOUNDS:") || !line.trim()) {
+    const s = line.trim();
+    if (!s) {
+      return;
+    }
+    if (s.startsWith("BOUNDS:")) {
+      return;
+    }
+    if (s.startsWith("MAP:")) {
+      try {
+        const raw = JSON.parse(s.slice(4)) as Record<string, unknown>;
+        const n = (k: string) => (typeof raw[k] === "number" ? (raw[k] as number) : Number.NaN);
+        const padLeft = n("padLeft");
+        const padRight = n("padRight");
+        const padTop = n("padTop");
+        const padBottom = n("padBottom");
+        const ok = [padLeft, padRight, padTop, padBottom].every(
+          (v) => Number.isFinite(v) && v >= 0 && v < 1 && v <= 0.49
+        );
+        if (ok && padLeft + padRight < 1 && padTop + padBottom < 1) {
+          streamPads = { padLeft, padRight, padTop, padBottom };
+        }
+      } catch {
+        /* ignore malformed MAP */
+      }
       return;
     }
     void vscode.window.showWarningMessage(`Simulator helper: ${line}`);
@@ -156,7 +216,7 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
       const b64 = jpeg.toString("base64");
       // Drop frames if the webview is still busy — keeps the extension host and renderer lighter.
       const now = Date.now();
-      if (now - lastFramePostedAt < 66) {
+      if (now - lastFramePostedAt < 16) {
         continue;
       }
       lastFramePostedAt = now;
@@ -177,12 +237,41 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
   });
 }
 
-/** Normalized hit in [0,1]²; top-left of the streamed image matches Indigo top-left ratios. */
-function normalizedHit(clientX: number, clientY: number, dispW: number, dispH: number): { nx: number; ny: number } | undefined {
+/** Normalized hit in [0,1]² in **device** space (letterbox removed using `streamPads` from `MAP:`). */
+function normalizedHit(
+  clientX: number,
+  clientY: number,
+  dispW: number,
+  dispH: number
+): { nx: number; ny: number } | undefined {
   if (dispW <= 0 || dispH <= 0) {
     return undefined;
   }
-  return { nx: clientX / dispW, ny: clientY / dispH };
+  const x0 = clientX / dispW;
+  const y0 = clientY / dispH;
+  const { padLeft, padRight, padTop, padBottom } = streamPads;
+  const innerW = 1 - padLeft - padRight;
+  const innerH = 1 - padTop - padBottom;
+  if (innerW <= 1e-9 || innerH <= 1e-9) {
+    return {
+      nx: Math.max(0, Math.min(1, x0)),
+      ny: Math.max(0, Math.min(1, y0)),
+    };
+  }
+  let nx = (x0 - padLeft) / innerW;
+  let ny = (y0 - padTop) / innerH;
+  nx = Math.max(0, Math.min(1, nx));
+  ny = Math.max(0, Math.min(1, ny));
+  return { nx, ny };
+}
+
+function spawnTouch(bin: string, touchArgs: string[], env: NodeJS.ProcessEnv) {
+  try {
+    const p = cp.spawn(bin, ["touch", ...touchArgs], { stdio: "ignore", detached: true, env });
+    p.unref();
+  } catch {
+    /* ignore */
+  }
 }
 
 function runListWindowsDebug(context: vscode.ExtensionContext) {
@@ -243,22 +332,54 @@ export function activate(context: vscode.ExtensionContext) {
 
       panel.webview.onDidReceiveMessage(
         (msg) => {
-          if (msg?.type !== "pointerDown" || msg.button !== 0) {
+          if (!msg || typeof msg !== "object") {
+            return;
+          }
+          const m = msg as {
+            type?: string;
+            button?: number;
+            x?: number;
+            y?: number;
+            w?: number;
+            h?: number;
+          };
+          if (
+            typeof m.x !== "number" ||
+            typeof m.y !== "number" ||
+            typeof m.w !== "number" ||
+            typeof m.h !== "number"
+          ) {
             return;
           }
           const bin = ensureHelperBuilt(context);
           if (!bin) {
             return;
           }
-          const hit = normalizedHit(msg.x, msg.y, msg.w, msg.h);
+          const env = helperEnvForCapture();
+          const hit = normalizedHit(m.x, m.y, m.w, m.h);
           if (!hit) {
             return;
           }
-          cp.spawn(bin, ["touch", "tap", String(hit.nx), String(hit.ny)], {
-            stdio: "ignore",
-            detached: true,
-            env: helperEnvForCapture(),
-          }).unref();
+
+          if (m.type === "touchDown" && m.button === 0) {
+            panelTouchActive = true;
+            panelTouchLastMoveMs = 0;
+            spawnTouch(bin, ["down", String(hit.nx), String(hit.ny)], env);
+            return;
+          }
+          if (m.type === "touchMove" && panelTouchActive) {
+            const now = Date.now();
+            if (now - panelTouchLastMoveMs < 16) {
+              return;
+            }
+            panelTouchLastMoveMs = now;
+            spawnTouch(bin, ["move", String(hit.nx), String(hit.ny)], env);
+            return;
+          }
+          if ((m.type === "touchUp" || m.type === "touchCancel") && panelTouchActive) {
+            panelTouchActive = false;
+            spawnTouch(bin, ["up", String(hit.nx), String(hit.ny)], env);
+          }
         },
         undefined,
         context.subscriptions
@@ -269,6 +390,7 @@ export function activate(context: vscode.ExtensionContext) {
       panel.onDidDispose(() => {
         stopStream();
         activePanel = undefined;
+        panelTouchActive = false;
       });
     })
   );

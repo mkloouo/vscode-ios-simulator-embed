@@ -6,7 +6,7 @@
 //   stream — picks a Simulator window by **bundle ID** (see findSimulatorWindow), captures
 //            it with ScreenCaptureKit, writes JPEG frames to stdout (length-prefixed).
 //            Sends one BOUNDS line on stderr for click mapping.
-//   touch tap <nx> <ny> — Indigo HID touch (ratios 0…1 from top-left of device surface; works when Simulator is obscured).
+//   touch tap|down|up|move|longpress|swipe — Indigo HID (ratios 0…1 in device space; works when Simulator is obscured).
 //   list   — prints every shareable on-screen window as **NDJSON** (debug: bundleId, title, …).
 //
 // The extension spawns this binary; it is not a .app bundle, so we must
@@ -60,13 +60,18 @@ enum HelperError: Error, CustomStringConvertible {
     case .usage:
       return """
       Usage:
-        ios-sim-helper stream                    # capture (stderr BOUNDS, stdout JPEG frames)
-        ios-sim-helper touch tap <nx> <ny>       # Indigo HID tap; nx,ny in [0,1] top-left of simulated display
+        ios-sim-helper stream                    # capture (stderr BOUNDS + optional MAP, stdout JPEG frames)
+        ios-sim-helper touch tap <nx> <ny>
+        ios-sim-helper touch down <nx> <ny> | up <nx> <ny> | move <nx> <ny>
+        ios-sim-helper touch longpress <nx> <ny> [<holdMs>]   # default hold 600 ms
+        ios-sim-helper touch swipe <x1> <y1> <x2> <y2> [<durationMs>]  # default 300 ms
         ios-sim-helper list                      # NDJSON: all windows (bundle IDs for stream)
+
+      Coordinates nx, ny are [0,1] from top-left of the simulated display (after stream MAP letterbox in the extension).
 
       Optional environment:
         IOS_SIM_HELPER_BUNDLE_ID=<id>            # stream: filter windows by owning bundle id
-        IOS_SIM_UDID=<uuid>                      # touch: booted device UDID (if multiple simulators booted)
+        IOS_SIM_UDID=<uuid>                      # touch / MAP: booted device UDID (if multiple simulators booted)
       """
     case .noSimulatorWindow(let hint):
       return "No capture window found. \(hint)"
@@ -197,21 +202,62 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
 
 // MARK: - Indigo HID touch (private SimulatorKit SPI)
 
-/// Sends touch-down then touch-up at normalized device coordinates. Returns an error message on failure.
-private func runTouchTap(normX: Double, normY: Double) -> String? {
+/// `phase`: 1 = down, 2 = up, 0 = move (drag) update.
+private func hidSendPhase(normX: Double, normY: Double, phase: Int32) -> String? {
   var err = [CChar](repeating: 0, count: 512)
   guard IOSEmbedLoadSimulatorFrameworks() else {
     return "Failed to load CoreSimulator / SimulatorKit (is Xcode installed?)"
   }
   let udid: String? = ProcessInfo.processInfo.environment["IOS_SIM_UDID"]
-  guard IOSEmbedHIDSendTouch(udid, normX, normY, 1, &err, err.count) else {
-    return String(cString: err)
-  }
-  usleep(25_000)
-  guard IOSEmbedHIDSendTouch(udid, normX, normY, 2, &err, err.count) else {
+  guard IOSEmbedHIDSendTouch(udid, normX, normY, Int32(phase), &err, err.count) else {
     return String(cString: err)
   }
   return nil
+}
+
+/// Short down–up for a tap (single process; useful for scripts).
+private func runTouchTap(normX: Double, normY: Double) -> String? {
+  if let e = hidSendPhase(normX: normX, normY: normY, phase: 1) { return e }
+  usleep(25_000)
+  return hidSendPhase(normX: normX, normY: normY, phase: 2)
+}
+
+private func runTouchLongPress(normX: Double, normY: Double, holdMs: Int) -> String? {
+  if let e = hidSendPhase(normX: normX, normY: normY, phase: 1) { return e }
+  usleep(useconds_t(max(1, holdMs)) * 1000)
+  return hidSendPhase(normX: normX, normY: normY, phase: 2)
+}
+
+private func runTouchSwipe(x1: Double, y1: Double, x2: Double, y2: Double, durationMs: Int) -> String? {
+  guard IOSEmbedLoadSimulatorFrameworks() else {
+    return "Failed to load CoreSimulator / SimulatorKit (is Xcode installed?)"
+  }
+  let udid: String? = ProcessInfo.processInfo.environment["IOS_SIM_UDID"]
+  let dur = max(16, durationMs)
+  let steps = max(8, dur / 16)
+  let stepDelayUs = useconds_t(max(1000, (dur * 1000) / steps))
+
+  func send(_ phase: Int32, _ nx: Double, _ ny: Double) -> String? {
+    var err = [CChar](repeating: 0, count: 512)
+    guard IOSEmbedHIDSendTouch(udid, nx, ny, phase, &err, err.count) else {
+      return String(cString: err)
+    }
+    return nil
+  }
+
+  if let e = send(1, x1, y1) { return e }
+  if steps <= 1 {
+    usleep(stepDelayUs)
+    return send(2, x2, y2)
+  }
+  for i in 1..<steps {
+    let t = Double(i) / Double(steps - 1)
+    let nx = x1 + (x2 - x1) * t
+    let ny = y1 + (y2 - y1) * t
+    if let e = send(0, nx, ny) { return e }
+    usleep(stepDelayUs)
+  }
+  return send(2, x2, y2)
 }
 
 /// Backing scale of the `NSScreen` that contains the center of `windowFrame` (points, Cocoa global).
@@ -223,6 +269,30 @@ private func backingScale(for windowFrame: CGRect) -> CGFloat {
     }
   }
   return NSScreen.main?.backingScaleFactor ?? 2.0
+}
+
+/// Letterbox of the booted device’s LCD inside the Simulator window (fractions of window width/height).
+private func mapInsetsForDeviceInWindow(
+  windowWidth: Double,
+  windowHeight: Double,
+  deviceWidth: Double,
+  deviceHeight: Double
+) -> (padLeft: Double, padRight: Double, padTop: Double, padBottom: Double) {
+  guard windowWidth > 0, windowHeight > 0, deviceWidth > 0, deviceHeight > 0 else {
+    return (0, 0, 0, 0)
+  }
+  let w = windowWidth
+  let h = windowHeight
+  let scale = min(w / deviceWidth, h / deviceHeight)
+  let fittedW = deviceWidth * scale
+  let fittedH = deviceHeight * scale
+  let ox = (w - fittedW) / 2
+  let oy = (h - fittedH) / 2
+  let padLeft = ox / w
+  let padRight = (w - ox - fittedW) / w
+  let padTop = oy / h
+  let padBottom = (h - oy - fittedH) / h
+  return (padLeft, padRight, padTop, padBottom)
 }
 
 // MARK: - ScreenCaptureKit delegate
@@ -255,8 +325,11 @@ final class StreamOutput: NSObject, SCStreamOutput {
 /// Configures and runs capture until stdin closes (parent process kill/dispose).
 ///
 /// Protocol for the Node extension:
-///   1. One line on stderr: `BOUNDS:{...json...}\n` with window frame (for click mapping).
-///   2. Repeated on stdout: 4-byte big-endian length + JPEG bytes (no delimiters otherwise).
+///   1. One line on stderr: `BOUNDS:{...}\n` with window frame in Cocoa global coordinates (points).
+///   2. Optional: `MAP:{"padLeft","padRight","padTop","padBottom"}\n` — letterbox of the device LCD inside
+///      the captured window (fractions of window width/height). The webview maps clicks through this inset
+///      before sending normalized Indigo coordinates.
+///   3. Repeated on stdout: 4-byte big-endian length + JPEG bytes (no delimiters otherwise).
 @MainActor
 private func runStream() async throws {
   let window = try await findSimulatorWindow()
@@ -273,6 +346,32 @@ private func runStream() async throws {
   guard let line = String(data: json, encoding: .utf8) else { throw HelperError.streamFailed("bounds encode") }
   FileHandle.standardError.write(Data("BOUNDS:\(line)\n".utf8))
 
+  var errMap = [CChar](repeating: 0, count: 512)
+  let envUdid =
+    ProcessInfo.processInfo.environment["IOS_SIM_UDID"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  let udidForMap: String? = envUdid.isEmpty ? nil : envUdid
+  var dW: Double = 0
+  var dH: Double = 0
+  if IOSEmbedBootedMainScreenLogicalSize(udidForMap, &dW, &dH, &errMap, errMap.count), dW > 0, dH > 0 {
+    let ins = mapInsetsForDeviceInWindow(
+      windowWidth: Double(frame.width),
+      windowHeight: Double(frame.height),
+      deviceWidth: dW,
+      deviceHeight: dH
+    )
+    let mapPayload: [String: Double] = [
+      "padLeft": ins.padLeft,
+      "padRight": ins.padRight,
+      "padTop": ins.padTop,
+      "padBottom": ins.padBottom,
+    ]
+    if let mj = try? JSONSerialization.data(withJSONObject: mapPayload),
+      let mline = String(data: mj, encoding: .utf8)
+    {
+      FileHandle.standardError.write(Data("MAP:\(mline)\n".utf8))
+    }
+  }
+
   // Capture only this window (not the whole display).
   let filter = SCContentFilter(desktopIndependentWindow: window)
   let config = SCStreamConfiguration()
@@ -281,7 +380,7 @@ private func runStream() async throws {
   let capH = min(frame.height * scale, 2560)
   config.width = max(1, Int(capW))
   config.height = max(1, Int(capH))
-  config.minimumFrameInterval = CMTime(value: 1, timescale: 12)  // ~12 fps
+  config.minimumFrameInterval = CMTime(value: 1, timescale: 60)  // up to ~60 fps
   config.pixelFormat = kCVPixelFormatType_32BGRA as OSType
   config.showsCursor = false
   config.capturesAudio = false
@@ -334,13 +433,90 @@ enum Entry {
 
     if first == "touch" {
       let r = Array(args.dropFirst())
-      guard r.count == 3, r[0] == "tap", let nx = Double(r[1]), let ny = Double(r[2]) else {
+      guard let sub = r.first else {
         fputs("\(HelperError.usage)\n", stderr)
         exit(2)
       }
-      let fail: String? = await MainActor.run {
-        runTouchTap(normX: nx, normY: ny)
+      let tail = Array(r.dropFirst())
+
+      enum TouchOp {
+        case tap(Double, Double)
+        case down(Double, Double)
+        case up(Double, Double)
+        case move(Double, Double)
+        case longpress(Double, Double, Int)
+        case swipe(Double, Double, Double, Double, Int)
       }
+
+      let op: TouchOp?
+      switch sub {
+      case "tap":
+        if tail.count == 2, let nx = Double(tail[0]), let ny = Double(tail[1]) {
+          op = .tap(nx, ny)
+        } else {
+          op = nil
+        }
+      case "down":
+        if tail.count == 2, let nx = Double(tail[0]), let ny = Double(tail[1]) {
+          op = .down(nx, ny)
+        } else {
+          op = nil
+        }
+      case "up":
+        if tail.count == 2, let nx = Double(tail[0]), let ny = Double(tail[1]) {
+          op = .up(nx, ny)
+        } else {
+          op = nil
+        }
+      case "move":
+        if tail.count == 2, let nx = Double(tail[0]), let ny = Double(tail[1]) {
+          op = .move(nx, ny)
+        } else {
+          op = nil
+        }
+      case "longpress":
+        if tail.count >= 2, let nx = Double(tail[0]), let ny = Double(tail[1]) {
+          let ms = tail.count >= 3 ? max(1, Int(tail[2]) ?? 600) : 600
+          op = .longpress(nx, ny, ms)
+        } else {
+          op = nil
+        }
+      case "swipe":
+        if tail.count >= 4,
+          let x1 = Double(tail[0]), let y1 = Double(tail[1]),
+          let x2 = Double(tail[2]), let y2 = Double(tail[3])
+        {
+          let dur = max(16, tail.count >= 5 ? Int(tail[4]) ?? 300 : 300)
+          op = .swipe(x1, y1, x2, y2, dur)
+        } else {
+          op = nil
+        }
+      default:
+        op = nil
+      }
+
+      guard let parsed = op else {
+        fputs("\(HelperError.usage)\n", stderr)
+        exit(2)
+      }
+
+      let fail: String? = await MainActor.run {
+        switch parsed {
+        case .tap(let nx, let ny):
+          return runTouchTap(normX: nx, normY: ny)
+        case .down(let nx, let ny):
+          return hidSendPhase(normX: nx, normY: ny, phase: 1)
+        case .up(let nx, let ny):
+          return hidSendPhase(normX: nx, normY: ny, phase: 2)
+        case .move(let nx, let ny):
+          return hidSendPhase(normX: nx, normY: ny, phase: 0)
+        case .longpress(let nx, let ny, let ms):
+          return runTouchLongPress(normX: nx, normY: ny, holdMs: ms)
+        case .swipe(let x1, let y1, let x2, let y2, let dur):
+          return runTouchSwipe(x1: x1, y1: y1, x2: x2, y2: y2, durationMs: dur)
+        }
+      }
+
       if let fail {
         fputs("\(fail)\n", stderr)
         exit(1)
