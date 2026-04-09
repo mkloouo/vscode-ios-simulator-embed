@@ -65,7 +65,7 @@ Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator u
 ## Limits
 
 - **Performance**: ~12 FPS capture + coalesced webview updates; still CPU-heavy. Use setting **streamJpegQuality** to trade quality vs bandwidth.
-- **Packaging**: `vscode:prepublish` runs `scripts/stage-native-helper.sh`, which copies `.build/release/ios-sim-helper` into `native/ios-sim-helper/dist/` (the VSIX includes `dist` and ignores SwiftPM `.build`). Run **`npm run build:native`** before **`vsce package`**. Ship **arm64** (and **x86_64** if you build a universal binary) for your users’ Macs.
+- **Packaging**: `vscode:prepublish` runs `scripts/stage-native-helper.sh`, which copies `.build/release/ios-sim-helper` into `native/ios-sim-helper/dist/` (the VSIX includes `dist` and ignores SwiftPM `.build`). Run **`npm run build:native`** before packaging. **`npm run release -- patch`** (or `minor` / `major`, or an exact **`1.2.3`**) requires a clean git tree: it bumps `package.json`, creates a **`chore(release): …`** commit and **`vX.Y.Z`** tag, then runs **`vsce package`**. Shorthand: **`npm run release:patch`**. Ship **arm64** (and **x86_64** if you build a universal binary) for your users’ Macs.
 
 ## Native helper CLI
 
