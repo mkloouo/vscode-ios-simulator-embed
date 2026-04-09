@@ -254,6 +254,30 @@ static BOOL HIDClientSendIndigoMessage(
   return YES;
 }
 
+/// `direction` matches idb / `ButtonEventTypeDown` (1) and `ButtonEventTypeUp` (2) in Indigo.h.
+static IndigoMessage *BuildKeyboardMessage(int hidUsage, int direction, char *errBuf, size_t errLen) {
+  IndigoMessage *(*fn)(int, int) = (void *)dlsym(RTLD_DEFAULT, "IndigoHIDMessageForKeyboardArbitrary");
+  if (!fn) {
+    StrErr(errBuf, errLen, @"IndigoHIDMessageForKeyboardArbitrary not found (load SimulatorKit / Xcode)");
+    return NULL;
+  }
+  IndigoMessage *msg = fn(hidUsage, direction);
+  if (!msg) {
+    StrErr(errBuf, errLen, @"IndigoHIDMessageForKeyboardArbitrary returned null");
+    return NULL;
+  }
+  return msg;
+}
+
+static BOOL HIDClientSendKeyboard(id client, unsigned int hidUsage, BOOL keyDown, char *errBuf, size_t errLen) {
+  int direction = keyDown ? (int)ButtonEventTypeDown : (int)ButtonEventTypeUp;
+  IndigoMessage *message = BuildKeyboardMessage((int)hidUsage, direction, errBuf, errLen);
+  if (!message) {
+    return NO;
+  }
+  return HIDClientSendIndigoMessage(client, message, errBuf, errLen);
+}
+
 static BOOL HIDClientSendIndigoTouch(id client, double xRatio, double yRatio, int phase, char *errBuf, size_t errLen) {
   if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
     StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
@@ -375,6 +399,15 @@ BOOL IOSEmbedHIDSessionSend(void *session, double xRatio, double yRatio, int pha
   }
   id client = (__bridge id)session;
   return HIDClientSendIndigoTouch(client, xRatio, yRatio, phase, errBuf, errLen);
+}
+
+BOOL IOSEmbedHIDSessionSendKeyboard(void *session, unsigned int hidUsage, BOOL keyDown, char *errBuf, size_t errLen) {
+  if (!session) {
+    StrErr(errBuf, errLen, @"session is null");
+    return NO;
+  }
+  id client = (__bridge id)session;
+  return HIDClientSendKeyboard(client, hidUsage, keyDown, errBuf, errLen);
 }
 
 void IOSEmbedHIDSessionClose(void *session) {

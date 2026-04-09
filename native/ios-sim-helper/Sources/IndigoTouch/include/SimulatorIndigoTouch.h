@@ -39,4 +39,12 @@ FOUNDATION_EXPORT BOOL IOSEmbedHIDSessionSend(
   char *_Nonnull errBuf,
   size_t errLen);
 
+/// USB HID keyboard usage (page 0x07). `keyDown` YES = press, NO = release (same session as touch).
+FOUNDATION_EXPORT BOOL IOSEmbedHIDSessionSendKeyboard(
+  void *_Nonnull session,
+  unsigned int hidUsage,
+  BOOL keyDown,
+  char *_Nonnull errBuf,
+  size_t errLen);
+
 FOUNDATION_EXPORT void IOSEmbedHIDSessionClose(void *_Nullable session);

@@ -55,7 +55,7 @@ enum HelperError: Error, CustomStringConvertible {
         ios-sim-helper stream                    # capture (stderr BOUNDS + optional MAP, stdout JPEG frames)
         ios-sim-helper touch tap <nx> <ny>
         ios-sim-helper touch down <nx> <ny> | up <nx> <ny> | move <nx> <ny>
-        ios-sim-helper touch sess                 # stdin lines: d nx ny | m nx ny | u nx ny | q (one HID client)
+        ios-sim-helper touch sess                 # stdin: d|m|u nx ny | kd|ku|kp hidUsage | q (one HID client)
         ios-sim-helper touch longpress <nx> <ny> [<holdMs>]   # default hold 600 ms
         ios-sim-helper touch swipe <x1> <y1> <x2> <y2> [<durationMs>]  # default 300 ms
         ios-sim-helper list                      # NDJSON: all windows (bundle IDs for stream)
@@ -269,7 +269,17 @@ private func runTouchSwipe(x1: Double, y1: Double, x2: Double, y2: Double, durat
   return send(2, x2, y2)
 }
 
-/// One persistent HID client; reads stdin until EOF or `q`. Lines: `d nx ny`, `m nx ny`, `u nx ny`, `q`.
+/// Parse decimal or `0x` hex for HID usage arguments.
+private func parseHIDUsage(_ s: String) -> UInt32? {
+  let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+  if t.hasPrefix("0x") || t.hasPrefix("0X") {
+    return UInt32(String(t.dropFirst(2)), radix: 16)
+  }
+  return UInt32(t)
+}
+
+/// One persistent HID client; reads stdin until EOF or `q`.
+/// Touch: `d|m|u nx ny`. Keyboard (USB HID usage, page 0x07): `kd usage`, `ku usage`, `kp usage` (press = down+up).
 private func runTouchSession() async {
   await MainActor.run {
     connectToWindowServer()
@@ -312,7 +322,8 @@ private func runTouchSession() async {
 
     enum TouchSessOutcome {
       case failure(String)
-      case success(tag: String, nx: Double, ny: Double)
+      case touchOk(tag: String, nx: Double, ny: Double)
+      case keyboardOk(op: String, usage: UInt32)
     }
 
     let outcome: TouchSessOutcome = await MainActor.run { () -> TouchSessOutcome in
@@ -320,42 +331,79 @@ private func runTouchSession() async {
         return .failure("session lost")
       }
       var err = [CChar](repeating: 0, count: 512)
-      let phase: Int32
+
       switch cmd {
-      case "d", "down":
-        phase = 1
-      case "u", "up":
-        phase = 2
-      case "m", "move":
-        phase = 0
+      case "kd", "keydown":
+        guard parts.count == 2, let u = parseHIDUsage(parts[1]) else {
+          return .failure("expected: kd <hidUsage>")
+        }
+        guard IOSEmbedHIDSessionSendKeyboard(session, u, true, &err, err.count) else {
+          return .failure(String(cString: err))
+        }
+        return .keyboardOk(op: "kd", usage: u)
+      case "ku", "keyup":
+        guard parts.count == 2, let u = parseHIDUsage(parts[1]) else {
+          return .failure("expected: ku <hidUsage>")
+        }
+        guard IOSEmbedHIDSessionSendKeyboard(session, u, false, &err, err.count) else {
+          return .failure(String(cString: err))
+        }
+        return .keyboardOk(op: "ku", usage: u)
+      case "kp", "keypress":
+        guard parts.count == 2, let u = parseHIDUsage(parts[1]) else {
+          return .failure("expected: kp <hidUsage>")
+        }
+        guard IOSEmbedHIDSessionSendKeyboard(session, u, true, &err, err.count) else {
+          return .failure(String(cString: err))
+        }
+        guard IOSEmbedHIDSessionSendKeyboard(session, u, false, &err, err.count) else {
+          return .failure(String(cString: err))
+        }
+        return .keyboardOk(op: "kp", usage: u)
+      case "d", "down", "m", "move", "u", "up":
+        let phase: Int32
+        switch cmd {
+        case "d", "down": phase = 1
+        case "u", "up": phase = 2
+        case "m", "move": phase = 0
+        default: return .failure("internal")
+        }
+        guard parts.count == 3, let nx = Double(parts[1]), let ny = Double(parts[2]) else {
+          return .failure("expected: d|m|u <nx> <ny>")
+        }
+        guard IOSEmbedHIDSessionSend(session, nx, ny, phase, &err, err.count) else {
+          return .failure(String(cString: err))
+        }
+        let tag: String
+        switch cmd {
+        case "d", "down": tag = "d"
+        case "m", "move": tag = "m"
+        case "u", "up": tag = "u"
+        default: tag = String(cmd.prefix(1))
+        }
+        return .touchOk(tag: tag, nx: nx, ny: ny)
       default:
-        return .failure("unknown command (use d|m|u|q)")
+        return .failure("unknown command (d|m|u|kd|ku|kp|q)")
       }
-      guard parts.count == 3, let nx = Double(parts[1]), let ny = Double(parts[2]) else {
-        return .failure("expected: d|m|u <nx> <ny>")
-      }
-      guard IOSEmbedHIDSessionSend(session, nx, ny, phase, &err, err.count) else {
-        return .failure(String(cString: err))
-      }
-      let tag: String
-      switch cmd {
-      case "d", "down": tag = "d"
-      case "m", "move": tag = "m"
-      case "u", "up": tag = "u"
-      default: tag = String(cmd.prefix(1))
-      }
-      return .success(tag: tag, nx: nx, ny: ny)
     }
 
     switch outcome {
     case .failure(let errMsg):
       FileHandle.standardError.write(Data("ERR:\(errMsg)\n".utf8))
       fflush(stderr)
-    case .success(let tag, let nx, let ny):
+    case .touchOk(let tag, let nx, let ny):
       let touchDbg = ProcessInfo.processInfo.environment["IOS_SIM_HELPER_TOUCH_DEBUG"]?
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
       if touchDbg == "1" || touchDbg == "true" || touchDbg == "yes" {
         let okLine = "OK:\(tag) \(nx) \(ny)\n"
+        FileHandle.standardError.write(Data(okLine.utf8))
+        fflush(stderr)
+      }
+    case .keyboardOk(let op, let usage):
+      let touchDbg = ProcessInfo.processInfo.environment["IOS_SIM_HELPER_TOUCH_DEBUG"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+      if touchDbg == "1" || touchDbg == "true" || touchDbg == "yes" {
+        let okLine = "OK:\(op) \(usage)\n"
         FileHandle.standardError.write(Data(okLine.utf8))
         fflush(stderr)
       }
