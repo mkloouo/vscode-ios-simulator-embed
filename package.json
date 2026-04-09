@@ -5,6 +5,14 @@
   "version": "1.0.0",
   "publisher": "mkloouo",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mkloouo/vscode-ios-simulator-embed.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mkloouo/vscode-ios-simulator-embed/issues"
+  },
+  "homepage": "https://github.com/mkloouo/vscode-ios-simulator-embed#readme",
   "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.85.0"

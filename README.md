@@ -6,6 +6,8 @@ VS Code / Cursor extension that streams the iOS Simulator window into a webview 
 
 This is not true window embedding; it is a live JPEG stream plus host-side HID injection.
 
+**Source:** [github.com/mkloouo/vscode-ios-simulator-embed](https://github.com/mkloouo/vscode-ios-simulator-embed)
+
 ## Demo
 
 Screen recording converted to GIF (first ~28s, 720px wide). Streamed panel with touch forwarding to a booted simulator.
