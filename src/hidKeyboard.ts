@@ -67,6 +67,8 @@ const CODE_TO_HID: Record<string, number> = {
   BracketLeft: 47,
   BracketRight: 48,
   Backslash: 49,
+  /** Non-US \ and | (ISO layouts). */
+  IntlBackslash: 100,
   Semicolon: 51,
   Quote: 52,
   Backquote: 53,
@@ -117,6 +119,155 @@ function kp(usage: number): string {
   return `kp ${usage}`;
 }
 
+function shiftChord(usage: number): string[] {
+  return [`kd ${HID_LEFT_SHIFT}`, kp(usage), `ku ${HID_LEFT_SHIFT}`];
+}
+
+function altChord(usage: number): string[] {
+  return [`kd ${HID_LEFT_ALT}`, kp(usage), `ku ${HID_LEFT_ALT}`];
+}
+
+/** True if these stdin lines already press Shift (avoid double with ev.shiftKey). */
+function linesIncludeShiftDown(lines: string[]): boolean {
+  return lines.includes(`kd ${HID_LEFT_SHIFT}`);
+}
+
+/** True if these lines already press Alt (avoid double with ev.altKey). */
+function linesIncludeAltDown(lines: string[]): boolean {
+  return lines.includes(`kd ${HID_LEFT_ALT}`);
+}
+
+/**
+ * US QWERTY: one character → HID lines (may include shift/alt inside).
+ * ASCII 32–126; TAB/LF; null if unsupported.
+ */
+export function hidLinesForAsciiChar(ch: string): string[] | null {
+  const cp = ch.codePointAt(0);
+  if (cp === undefined) {
+    return null;
+  }
+  if (cp === 9) {
+    return [kp(43)];
+  }
+  if (cp === 10) {
+    return [kp(40)];
+  }
+  if (cp < 32 || cp > 126) {
+    return null;
+  }
+  if (cp === 127) {
+    return null;
+  }
+
+  if (ch >= "a" && ch <= "z") {
+    return [kp(4 + (ch.charCodeAt(0) - 97))];
+  }
+  if (ch >= "A" && ch <= "Z") {
+    return shiftChord(4 + (ch.charCodeAt(0) - 65));
+  }
+  if (ch >= "0" && ch <= "9") {
+    return [kp(ch === "0" ? 39 : 29 + (ch.charCodeAt(0) - 48))];
+  }
+
+  const shiftNum: Record<string, number> = {
+    "!": 30,
+    "@": 31,
+    "#": 32,
+    $: 33,
+    "%": 34,
+    "^": 35,
+    "&": 36,
+    "*": 37,
+    "(": 38,
+    ")": 39,
+  };
+  if (shiftNum[ch] !== undefined) {
+    return shiftChord(shiftNum[ch]);
+  }
+
+  switch (ch) {
+    case " ":
+      return [kp(44)];
+    case "`":
+      return [kp(53)];
+    case "~":
+      return shiftChord(53);
+    case "-":
+      return [kp(45)];
+    case "_":
+      return shiftChord(45);
+    case "=":
+      return [kp(46)];
+    case "+":
+      return shiftChord(46);
+    case "[":
+      return [kp(47)];
+    case "{":
+      return shiftChord(47);
+    case "]":
+      return [kp(48)];
+    case "}":
+      return shiftChord(48);
+    case "\\":
+      return [kp(49)];
+    case "|":
+      return shiftChord(49);
+    case ";":
+      return [kp(51)];
+    case ":":
+      return shiftChord(51);
+    case "'":
+      return [kp(52)];
+    case '"':
+      return shiftChord(52);
+    case ",":
+      return [kp(54)];
+    case "<":
+      return shiftChord(54);
+    case ".":
+      return [kp(55)];
+    case ">":
+      return shiftChord(55);
+    case "/":
+      return [kp(56)];
+    case "?":
+      return shiftChord(56);
+    default:
+      return null;
+  }
+}
+
+/**
+ * Latin-1 / common symbols not in ASCII (layout approximations, US Mac–oriented).
+ */
+function hidLinesForLatin1Char(ch: string): string[] {
+  const cp = ch.codePointAt(0);
+  if (cp === undefined) {
+    return [];
+  }
+  // £ — Option+3 on typical US Mac keyboard
+  if (cp === 0xa3) {
+    return altChord(32);
+  }
+  // § — Option+6 on many Mac layouts (varies by region)
+  if (cp === 0xa7) {
+    return altChord(35);
+  }
+  return [];
+}
+
+/** Iterate Unicode scalar values (handles astral planes for batch paste). */
+function forEachCodePoint(text: string, fn: (ch: string) => void): void {
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    if (cp === undefined) {
+      break;
+    }
+    fn(String.fromCodePoint(cp));
+    i += cp > 0xffff ? 2 : 1;
+  }
+}
+
 /**
  * Wrap inner `kp` lines with modifier down/up.
  * Press: ⌘ → Ctrl → Alt → Shift (GUI first, Mac-idiomatic for chords).
@@ -158,58 +309,39 @@ export function hidSessionLinesForWebKey(ev: WebKeyFields): string[] {
     return wrapModifiers([kp(usage)], ev);
   }
 
-  if (k.length === 1) {
-    const cp = k.codePointAt(0);
-    if (cp === undefined || cp > 0x7f) {
-      return [];
-    }
-    const ch = k;
-    if (ch >= "a" && ch <= "z") {
-      return wrapModifiers([kp(4 + (ch.charCodeAt(0) - 97))], ev);
-    }
-    if (ch >= "A" && ch <= "Z") {
-      const u = 4 + (ch.charCodeAt(0) - 65);
-      if (ev.shiftKey) {
-        return wrapModifiers([kp(u)], ev);
-      }
-      return wrapModifiers([kp(u)], { ...ev, shiftKey: true });
-    }
-    if (ch >= "0" && ch <= "9") {
-      const digitUsage = ch === "0" ? 39 : 29 + (ch.charCodeAt(0) - 48);
-      return wrapModifiers([kp(digitUsage)], ev);
-    }
-    if (ch === " ") {
-      return wrapModifiers([kp(44)], ev);
-    }
+  const ascii = hidLinesForAsciiChar(k);
+  if (ascii !== null && ascii.length > 0) {
+    const ev2: WebKeyFields = {
+      ...ev,
+      shiftKey: linesIncludeShiftDown(ascii) ? false : ev.shiftKey,
+      altKey: linesIncludeAltDown(ascii) ? false : ev.altKey,
+    };
+    return wrapModifiers(ascii, ev2);
+  }
+
+  const latin = hidLinesForLatin1Char(k);
+  if (latin.length > 0) {
+    const ev2: WebKeyFields = {
+      ...ev,
+      altKey: linesIncludeAltDown(latin) ? false : ev.altKey,
+      shiftKey: linesIncludeShiftDown(latin) ? false : ev.shiftKey,
+    };
+    return wrapModifiers(latin, ev2);
   }
 
   return [];
 }
 
-/** Typed text: ASCII letters, digits, space; other chars skipped. */
+/** Typed / pasted text: US QWERTY punctuation, TAB/LF, and a few Latin-1 symbols. */
 export function hidSessionLinesForTextBatch(text: string): string[] {
   const lines: string[] = [];
-  for (const ch of text) {
-    const cp = ch.codePointAt(0);
-    if (cp === undefined || cp > 0x7f) {
-      continue;
+  forEachCodePoint(text, (ch) => {
+    const a = hidLinesForAsciiChar(ch);
+    if (a !== null && a.length > 0) {
+      lines.push(...a);
+      return;
     }
-    if (ch >= "a" && ch <= "z") {
-      lines.push(kp(4 + (ch.charCodeAt(0) - 97)));
-      continue;
-    }
-    if (ch >= "A" && ch <= "Z") {
-      const u = 4 + (ch.charCodeAt(0) - 65);
-      lines.push(`kd ${HID_LEFT_SHIFT}`, kp(u), `ku ${HID_LEFT_SHIFT}`);
-      continue;
-    }
-    if (ch >= "0" && ch <= "9") {
-      lines.push(kp(ch === "0" ? 39 : 29 + (ch.charCodeAt(0) - 48)));
-      continue;
-    }
-    if (ch === " ") {
-      lines.push(kp(44));
-    }
-  }
+    lines.push(...hidLinesForLatin1Char(ch));
+  });
   return lines;
 }
