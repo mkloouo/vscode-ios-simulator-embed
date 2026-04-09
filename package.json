@@ -54,6 +54,11 @@
           "type": "boolean",
           "default": false,
           "description": "Log LCD letterbox (MAP) diagnostics: show Output when MAP is skipped, reject reasons, and verbose MAP_DEBUG from the native stream helper."
+        },
+        "ios-simulator-embed.mapStackVerticalLetterboxOnTop": {
+          "type": "boolean",
+          "default": true,
+          "description": "MAP: treat vertical letterbox as chrome above the LCD only (padBottom = 0, LCD bottom-aligned in the captured window). Disable to use centered vertical fit (equal padTop/padBottom)."
         }
       }
     }

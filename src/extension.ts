@@ -39,6 +39,9 @@ function helperEnvForCapture(): NodeJS.ProcessEnv {
   if (cfg.get<boolean>("debugMap")) {
     env.IOS_SIM_HELPER_MAP_DEBUG = "1";
   }
+  if (cfg.get<boolean>("mapStackVerticalLetterboxOnTop", true)) {
+    env.IOS_SIM_HELPER_MAP_TOP_STACK = "1";
+  }
   return env;
 }
 
@@ -136,7 +139,7 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. Enable <code>debugMap</code> for Output logs when LCD letterbox (MAP) is skipped or rejected; reopen the panel after toggling. <code>debugTouches</code> for pointer coords. <code>simulatorUdid</code> if MAP/insets are wrong. Toolbar uses <code>simctl</code> / Accessibility as before.</div>
+  <div id="hint">Streamed Simulator. MAP defaults to <strong>top letterbox only</strong> (<code>mapStackVerticalLetterboxOnTop</code>): LCD aligned to bottom of the capture. Disable for centered vertical fit. <code>debugMap</code> / <code>debugTouches</code>; reopen panel after MAP settings. <code>simulatorUdid</code> if needed.</div>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
     <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Home</span>
@@ -758,6 +761,14 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.affectsConfiguration("ios-simulator-embed.debugMap")) {
         debugOutputChannel.appendLine(
           "[MAP] `debugMap` changed — stop and reopen the streamed panel so the capture helper restarts with MAP_DEBUG env and fresh stderr lines."
+        );
+        if (mapDebugEnabled()) {
+          debugOutputChannel.show(true);
+        }
+      }
+      if (e.affectsConfiguration("ios-simulator-embed.mapStackVerticalLetterboxOnTop")) {
+        debugOutputChannel.appendLine(
+          "[MAP] `mapStackVerticalLetterboxOnTop` changed — reopen the stream panel so ios-sim-helper restarts with updated IOS_SIM_HELPER_MAP_TOP_STACK."
         );
         if (mapDebugEnabled()) {
           debugOutputChannel.show(true);

@@ -348,6 +348,10 @@ private func backingScale(for windowFrame: CGRect) -> CGFloat {
 }
 
 /// Letterbox of the booted device’s LCD inside the Simulator window (fractions of window width/height).
+///
+/// Horizontal: aspect-fit is **centered** (padLeft / padRight).
+/// Vertical: default (`IOS_SIM_HELPER_MAP_TOP_STACK`) stacks all letterbox on **top** (LCD bottom-aligned, `padBottom = 0`).
+/// If that env is unset/false, vertical letterbox is **split evenly** (centered fit).
 private func mapInsetsForDeviceInWindow(
   windowWidth: Double,
   windowHeight: Double,
@@ -363,13 +367,29 @@ private func mapInsetsForDeviceInWindow(
   let fittedW = deviceWidth * scale
   let fittedH = deviceHeight * scale
   let ox = (w - fittedW) / 2
-  let oy = (h - fittedH) / 2
+  let stackTopEnv =
+    ProcessInfo.processInfo.environment["IOS_SIM_HELPER_MAP_TOP_STACK"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    .lowercased() ?? ""
+  let stackVerticalOnTop =
+    stackTopEnv == "1" || stackTopEnv == "true" || stackTopEnv == "yes"
+  let oy: Double
+  if stackVerticalOnTop {
+    // All vertical slack above the LCD (Simulator chrome / title bar); LCD flush to bottom of window.
+    oy = h - fittedH
+  } else {
+    oy = (h - fittedH) / 2
+  }
   // Clamp to [0,1): float noise can yield tiny negative L/R when the fit is symmetric.
   func clampPad(_ v: Double) -> Double { min(max(v, 0), 0.999999) }
   let padLeft = clampPad(ox / w)
   let padRight = clampPad((w - ox - fittedW) / w)
   let padTop = clampPad(oy / h)
-  let padBottom = clampPad((h - oy - fittedH) / h)
+  let padBottom: Double
+  if stackVerticalOnTop {
+    padBottom = 0
+  } else {
+    padBottom = clampPad((h - oy - fittedH) / h)
+  }
   return (padLeft, padRight, padTop, padBottom)
 }
 
