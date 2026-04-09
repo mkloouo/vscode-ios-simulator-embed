@@ -23,3 +23,20 @@ FOUNDATION_EXPORT BOOL IOSEmbedBootedMainScreenLogicalSize(
   double *_Nonnull outHeight,
   char *_Nonnull errBuf,
   size_t errLen);
+
+/// Reuses one `SimDeviceLegacyHIDClient` for down / move / up so drags work across events.
+/// Returns an opaque pointer to release with `IOSEmbedHIDSessionClose`, or NULL on failure.
+FOUNDATION_EXPORT void *_Nullable IOSEmbedHIDSessionOpen(
+  NSString *_Nullable udid,
+  char *_Nonnull errBuf,
+  size_t errLen);
+
+FOUNDATION_EXPORT BOOL IOSEmbedHIDSessionSend(
+  void *_Nonnull session,
+  double xRatio,
+  double yRatio,
+  int phase,
+  char *_Nonnull errBuf,
+  size_t errLen);
+
+FOUNDATION_EXPORT void IOSEmbedHIDSessionClose(void *_Nullable session);

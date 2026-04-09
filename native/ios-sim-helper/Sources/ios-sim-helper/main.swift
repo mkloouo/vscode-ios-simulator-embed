@@ -63,6 +63,7 @@ enum HelperError: Error, CustomStringConvertible {
         ios-sim-helper stream                    # capture (stderr BOUNDS + optional MAP, stdout JPEG frames)
         ios-sim-helper touch tap <nx> <ny>
         ios-sim-helper touch down <nx> <ny> | up <nx> <ny> | move <nx> <ny>
+        ios-sim-helper touch sess                 # stdin lines: d nx ny | m nx ny | u nx ny | q (one HID client)
         ios-sim-helper touch longpress <nx> <ny> [<holdMs>]   # default hold 600 ms
         ios-sim-helper touch swipe <x1> <y1> <x2> <y2> [<durationMs>]  # default 300 ms
         ios-sim-helper list                      # NDJSON: all windows (bundle IDs for stream)
@@ -229,17 +230,20 @@ private func runTouchLongPress(normX: Double, normY: Double, holdMs: Int) -> Str
 }
 
 private func runTouchSwipe(x1: Double, y1: Double, x2: Double, y2: Double, durationMs: Int) -> String? {
-  guard IOSEmbedLoadSimulatorFrameworks() else {
-    return "Failed to load CoreSimulator / SimulatorKit (is Xcode installed?)"
-  }
   let udid: String? = ProcessInfo.processInfo.environment["IOS_SIM_UDID"]
+  var openErr = [CChar](repeating: 0, count: 512)
+  guard let session = IOSEmbedHIDSessionOpen(udid, &openErr, openErr.count) else {
+    return String(cString: openErr)
+  }
+  defer { IOSEmbedHIDSessionClose(session) }
+
   let dur = max(16, durationMs)
   let steps = max(8, dur / 16)
   let stepDelayUs = useconds_t(max(1000, (dur * 1000) / steps))
 
   func send(_ phase: Int32, _ nx: Double, _ ny: Double) -> String? {
     var err = [CChar](repeating: 0, count: 512)
-    guard IOSEmbedHIDSendTouch(udid, nx, ny, phase, &err, err.count) else {
+    guard IOSEmbedHIDSessionSend(session, nx, ny, phase, &err, err.count) else {
       return String(cString: err)
     }
     return nil
@@ -258,6 +262,78 @@ private func runTouchSwipe(x1: Double, y1: Double, x2: Double, y2: Double, durat
     usleep(stepDelayUs)
   }
   return send(2, x2, y2)
+}
+
+/// One persistent HID client; reads stdin until EOF or `q`. Lines: `d nx ny`, `m nx ny`, `u nx ny`, `q`.
+private func runTouchSession() async {
+  await MainActor.run {
+    connectToWindowServer()
+  }
+  let udid: String? = ProcessInfo.processInfo.environment["IOS_SIM_UDID"]
+  let opened: (Int, [CChar]) = await MainActor.run {
+    var e = [CChar](repeating: 0, count: 512)
+    guard let p = IOSEmbedHIDSessionOpen(udid, &e, e.count) else {
+      return (0, e)
+    }
+    return (Int(bitPattern: p), e)
+  }
+  guard opened.0 != 0 else {
+    fputs(String(cString: opened.1), stderr)
+    exit(1)
+  }
+  let sessionBits = opened.0
+  defer {
+    if let s = UnsafeMutableRawPointer(bitPattern: sessionBits) {
+      IOSEmbedHIDSessionClose(s)
+    }
+  }
+
+  while true {
+    let line: String? = await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+      DispatchQueue.global(qos: .utility).async {
+        cont.resume(returning: readLine())
+      }
+    }
+    guard let raw = line else { break }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+      continue
+    }
+    let parts = trimmed.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+    guard let cmd = parts.first else { continue }
+    if cmd == "q" || cmd == "quit" {
+      break
+    }
+
+    let errMsg: String? = await MainActor.run { () -> String? in
+      guard let session = UnsafeMutableRawPointer(bitPattern: sessionBits) else {
+        return "session lost"
+      }
+      var err = [CChar](repeating: 0, count: 512)
+      let phase: Int32
+      switch cmd {
+      case "d", "down":
+        phase = 1
+      case "u", "up":
+        phase = 2
+      case "m", "move":
+        phase = 0
+      default:
+        return "unknown command (use d|m|u|q)"
+      }
+      guard parts.count == 3, let nx = Double(parts[1]), let ny = Double(parts[2]) else {
+        return "expected: d|m|u <nx> <ny>"
+      }
+      guard IOSEmbedHIDSessionSend(session, nx, ny, phase, &err, err.count) else {
+        return String(cString: err)
+      }
+      return nil
+    }
+    if let errMsg {
+      FileHandle.standardError.write(Data("ERR:\(errMsg)\n".utf8))
+      fflush(stderr)
+    }
+  }
 }
 
 /// Backing scale of the `NSScreen` that contains the center of `windowFrame` (points, Cocoa global).
@@ -438,6 +514,15 @@ enum Entry {
         exit(2)
       }
       let tail = Array(r.dropFirst())
+
+      if sub == "sess" {
+        if !tail.isEmpty {
+          fputs("\(HelperError.usage)\n", stderr)
+          exit(2)
+        }
+        await runTouchSession()
+        exit(0)
+      }
 
       enum TouchOp {
         case tap(Double, Double)

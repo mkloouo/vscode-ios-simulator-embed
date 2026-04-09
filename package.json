@@ -44,6 +44,11 @@
           "type": "string",
           "default": "",
           "description": "Booted simulator UDID for Indigo touch injection (`xcrun simctl list devices | grep Booted`). Leave empty if only one simulator is booted."
+        },
+        "ios-simulator-embed.debugTouches": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log each touch to the Output panel (iOS Simulator Embed) and show a small coordinate HUD in the stream webview."
         }
       }
     }

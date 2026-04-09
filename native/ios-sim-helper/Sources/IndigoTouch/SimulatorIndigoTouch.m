@@ -183,6 +183,50 @@ static Class SimDeviceLegacyHIDClientClass(void) {
   return objc_lookUpClass("SimDeviceLegacyHIDClient");
 }
 
+static BOOL HIDClientSendIndigoTouch(id client, double xRatio, double yRatio, int phase, char *errBuf, size_t errLen) {
+  if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
+    StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
+    return NO;
+  }
+  if (phase != 0 && phase != 1 && phase != 2) {
+    StrErr(errBuf, errLen, @"phase must be 0 (move), 1 (down), or 2 (up)");
+    return NO;
+  }
+
+  size_t msgSize = 0;
+  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, phase, &msgSize);
+  if (!message || msgSize == 0) {
+    StrErr(errBuf, errLen, @"IndigoHIDMessageForMouseNSEvent unavailable or allocation failed");
+    return NO;
+  }
+
+  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+  __block NSError *sendErr = nil;
+
+  typedef void (^Completion)(NSError *);
+  SEL sendSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
+  Method meth = class_getInstanceMethod([client class], sendSel);
+  if (!meth) {
+    free(message);
+    StrErr(errBuf, errLen, @"sendWithMessage:freeWhenDone:completionQueue:completion: not found");
+    return NO;
+  }
+  IMP imp = method_getImplementation(meth);
+  void (*send)(id, SEL, IndigoMessage *, BOOL, dispatch_queue_t, Completion) = (void *)imp;
+  send(client, sendSel, message, YES, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(NSError *e) {
+    sendErr = e;
+    dispatch_semaphore_signal(sem);
+  });
+
+  dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+  if (sendErr) {
+    StrErr(errBuf, errLen, sendErr.localizedDescription);
+    return NO;
+  }
+  return YES;
+}
+
 BOOL IOSEmbedBootedMainScreenLogicalSize(
   NSString *udidFilter,
   double *outW,
@@ -227,15 +271,6 @@ BOOL IOSEmbedHIDSendTouch(
   int phase,
   char *errBuf,
   size_t errLen) {
-  if (xRatio < 0 || xRatio > 1 || yRatio < 0 || yRatio > 1) {
-    StrErr(errBuf, errLen, @"x/y ratios must be in [0,1]");
-    return NO;
-  }
-  if (phase != 0 && phase != 1 && phase != 2) {
-    StrErr(errBuf, errLen, @"phase must be 0 (move), 1 (down), or 2 (up)");
-    return NO;
-  }
-
   NSError *err = nil;
   id device = BootedSimDevice(udid, &err);
   if (!device) {
@@ -257,35 +292,48 @@ BOOL IOSEmbedHIDSendTouch(
     return NO;
   }
 
-  size_t msgSize = 0;
-  IndigoMessage *message = BuildTouchAtRatios(xRatio, yRatio, phase, &msgSize);
-  if (!message || msgSize == 0) {
-    StrErr(errBuf, errLen, @"IndigoHIDMessageForMouseNSEvent unavailable or allocation failed");
+  return HIDClientSendIndigoTouch(client, xRatio, yRatio, phase, errBuf, errLen);
+}
+
+void *IOSEmbedHIDSessionOpen(NSString *udid, char *errBuf, size_t errLen) {
+  if (!IOSEmbedLoadSimulatorFrameworks()) {
+    StrErr(errBuf, errLen, @"Failed to load CoreSimulator / SimulatorKit");
+    return NULL;
+  }
+  NSError *err = nil;
+  id device = BootedSimDevice(udid, &err);
+  if (!device) {
+    StrErr(errBuf, errLen, err.localizedDescription);
+    return NULL;
+  }
+  Class clientClass = SimDeviceLegacyHIDClientClass();
+  if (!clientClass) {
+    StrErr(errBuf, errLen, @"SimDeviceLegacyHIDClient class not found");
+    return NULL;
+  }
+  id clientAlloc = ((id (*)(Class, SEL))objc_msgSend)(clientClass, sel_registerName("alloc"));
+  id client = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+    clientAlloc, sel_registerName("initWithDevice:error:"), device, &err);
+  if (!client) {
+    StrErr(errBuf, errLen, err.localizedDescription ?: @"initWithDevice failed");
+    return NULL;
+  }
+  return (__bridge_retained void *)client;
+}
+
+BOOL IOSEmbedHIDSessionSend(void *session, double xRatio, double yRatio, int phase, char *errBuf, size_t errLen) {
+  if (!session) {
+    StrErr(errBuf, errLen, @"session is null");
     return NO;
   }
+  id client = (__bridge id)session;
+  return HIDClientSendIndigoTouch(client, xRatio, yRatio, phase, errBuf, errLen);
+}
 
-  dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-  __block NSError *sendErr = nil;
-
-  typedef void (^Completion)(NSError *);
-  SEL sendSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
-  Method meth = class_getInstanceMethod([client class], sendSel);
-  if (!meth) {
-    StrErr(errBuf, errLen, @"sendWithMessage:freeWhenDone:completionQueue:completion: not found");
-    return NO;
+void IOSEmbedHIDSessionClose(void *session) {
+  if (!session) {
+    return;
   }
-  IMP imp = method_getImplementation(meth);
-  void (*send)(id, SEL, IndigoMessage *, BOOL, dispatch_queue_t, Completion) = (void *)imp;
-  send(client, sendSel, message, YES, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(NSError *e) {
-    sendErr = e;
-    dispatch_semaphore_signal(sem);
-  });
-
-  dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-
-  if (sendErr) {
-    StrErr(errBuf, errLen, sendErr.localizedDescription);
-    return NO;
-  }
-  return YES;
+  id client = (__bridge_transfer id)session;
+  (void)client;
 }

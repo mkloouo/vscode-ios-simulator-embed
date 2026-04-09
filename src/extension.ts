@@ -18,6 +18,10 @@ let streamPads: StreamPads = { ...zeroPads };
 let panelTouchActive = false;
 let panelTouchLastMoveMs = 0;
 
+/** One `ios-sim-helper touch sess` process so down/move/up share a single HID client (drags work). */
+let touchSessionChild: cp.ChildProcess | undefined;
+let touchSessionStderrBuf = "";
+
 const debugOutputChannel = vscode.window.createOutputChannel("iOS Simulator Embed");
 
 /** Merged env for stream / Indigo touch (bundle id + optional booted UDID). */
@@ -57,7 +61,26 @@ function ensureHelperBuilt(context: vscode.ExtensionContext): string | undefined
   return bin;
 }
 
+function stopTouchSession() {
+  if (!touchSessionChild || touchSessionChild.killed) {
+    touchSessionChild = undefined;
+    touchSessionStderrBuf = "";
+    return;
+  }
+  try {
+    touchSessionChild.stdin?.write("q\n");
+    touchSessionChild.stdin?.end();
+  } catch {
+    /* ignore */
+  }
+  touchSessionChild.kill("SIGTERM");
+  touchSessionChild = undefined;
+  touchSessionStderrBuf = "";
+  panelTouchActive = false;
+}
+
 function stopStream() {
+  stopTouchSession();
   if (streamProcess && !streamProcess.killed) {
     try {
       streamProcess.stdin.end();
@@ -85,27 +108,114 @@ function panelHtml(webview: vscode.Webview): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     body { margin: 0; padding: 8px; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-font-family); }
+    #chromeBar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent); border-radius: 6px; max-width: 100%; box-sizing: border-box; }
+    #chromeBar .chromeTitle { flex: 1 1 auto; font-size: 12px; opacity: 0.85; min-width: 120px; }
+    .chromeBtn { font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; border-radius: 4px; border: 1px solid color-mix(in srgb, var(--vscode-editor-foreground) 25%, transparent); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .chromeBtn:hover { filter: brightness(1.08); }
     #wrap { position: relative; display: inline-block; max-width: 100%; }
     #frame { display: block; max-width: 100%; height: auto; cursor: pointer; user-select: none; touch-action: none; background: #111; }
     #hint { font-size: 12px; opacity: 0.75; margin-bottom: 8px; line-height: 1.35; }
+    #debugHud { position: absolute; left: 4px; bottom: 4px; margin: 0; padding: 4px 6px; font-size: 10px; line-height: 1.25; font-family: var(--vscode-editor-font-family); background: color-mix(in srgb, var(--vscode-editor-background) 85%, black); color: var(--vscode-editor-foreground); border-radius: 4px; max-width: calc(100% - 8px); pointer-events: none; z-index: 2; white-space: pre-wrap; }
+    #debugHud[hidden] { display: none !important; }
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. Pointer: tap (press/release), drag to scroll, hold for press-and-hold. Coordinates use the device screen inset inside the window. Set simulator UDID if multiple booted.</div>
+  <div id="hint">Streamed Simulator. Drag to scroll uses one HID session. <strong>Chrome row</strong>: Home / Screenshot / Rotate (screenshot uses <code>simctl</code>; Home/Rotate briefly activate Simulator and need Accessibility for System Events). Enable <code>debugTouches</code> for coordinate logging. Set UDID if multiple simulators are booted.</div>
+  <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
+    <span class="chromeTitle">Simulator chrome</span>
+    <button type="button" class="chromeBtn" data-action="home" title="Hardware home (⌘⇧H). Activates Simulator.app.">Home</button>
+    <button type="button" class="chromeBtn" data-action="screenshot" title="Save device screenshot via simctl (not the streamed JPEG).">Screenshot</button>
+    <button type="button" class="chromeBtn" data-action="rotate" title="Rotate right (⌘→). Activates Simulator.app.">Rotate</button>
+  </div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
+    <pre id="debugHud" hidden></pre>
   </div>
   <script nonce="streampanel">
     const vscode = acquireVsCodeApi();
     const img = document.getElementById('frame');
+    const debugHud = document.getElementById('debugHud');
     let activePointer = null;
+    let debugTouches = false;
+    let streamPads = { padLeft: 0, padRight: 0, padTop: 0, padBottom: 0 };
+
+    document.querySelectorAll('.chromeBtn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const action = btn.getAttribute('data-action');
+        if (action) vscode.postMessage({ type: 'chrome', action });
+      });
+    });
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg && msg.type === 'frame' && typeof msg.dataUrl === 'string') {
         img.src = msg.dataUrl;
       }
+      if (msg && msg.type === 'init') {
+        debugTouches = !!msg.debugTouches;
+        if (msg.streamPads && typeof msg.streamPads === 'object') {
+          streamPads = { ...streamPads, ...msg.streamPads };
+        }
+        debugHud.hidden = !debugTouches;
+        if (!debugTouches) debugHud.textContent = '';
+      }
+      if (msg && msg.type === 'streamMap' && msg.pads && typeof msg.pads === 'object') {
+        streamPads = { ...streamPads, ...msg.pads };
+      }
     });
+
+    function deviceRatios(p) {
+      const x0 = p.x / p.w;
+      const y0 = p.y / p.h;
+      const { padLeft, padRight, padTop, padBottom } = streamPads;
+      const innerW = 1 - padLeft - padRight;
+      const innerH = 1 - padTop - padBottom;
+      let nx = x0, ny = y0;
+      if (innerW > 1e-9 && innerH > 1e-9) {
+        nx = (x0 - padLeft) / innerW;
+        ny = (y0 - padTop) / innerH;
+        nx = Math.max(0, Math.min(1, nx));
+        ny = Math.max(0, Math.min(1, ny));
+      }
+      return { x0, y0, nx, ny };
+    }
+
+    function updateDebugHud(label, p) {
+      if (!debugTouches || !p) return;
+      const { x0, y0, nx, ny } = deviceRatios(p);
+      const { padLeft, padRight, padTop, padBottom } = streamPads;
+      const br = String.fromCharCode(10);
+      debugHud.textContent =
+        label +
+        br +
+        'img xy: ' +
+        p.x.toFixed(1) +
+        ', ' +
+        p.y.toFixed(1) +
+        '  disp: ' +
+        p.w.toFixed(0) +
+        '×' +
+        p.h.toFixed(0) +
+        br +
+        'in JPEG: ' +
+        x0.toFixed(4) +
+        ', ' +
+        y0.toFixed(4) +
+        br +
+        'MAP L,R,T,B: ' +
+        padLeft.toFixed(4) +
+        ', ' +
+        padRight.toFixed(4) +
+        ', ' +
+        padTop.toFixed(4) +
+        ', ' +
+        padBottom.toFixed(4) +
+        br +
+        '→ device: ' +
+        nx.toFixed(6) +
+        ', ' +
+        ny.toFixed(6);
+    }
 
     function relCoords(ev) {
       const r = img.getBoundingClientRect();
@@ -122,6 +232,7 @@ function panelHtml(webview: vscode.Webview): string {
       if (!p || !p.nw || !p.nh) return;
       try { img.setPointerCapture(ev.pointerId); } catch (_) {}
       activePointer = ev.pointerId;
+      updateDebugHud('down', p);
       vscode.postMessage({ type: 'touchDown', ...p, button: ev.button });
     });
 
@@ -129,6 +240,7 @@ function panelHtml(webview: vscode.Webview): string {
       if (activePointer === null || ev.pointerId !== activePointer) return;
       const p = relCoords(ev);
       if (!p) return;
+      updateDebugHud('move', p);
       vscode.postMessage({ type: 'touchMove', ...p });
     });
 
@@ -136,6 +248,7 @@ function panelHtml(webview: vscode.Webview): string {
       if (activePointer === null || ev.pointerId !== activePointer) return;
       const p = relCoords(ev);
       if (p) {
+        updateDebugHud(kind, p);
         vscode.postMessage({ type: kind, ...p, button: ev.button });
       }
       try { img.releasePointerCapture(ev.pointerId); } catch (_) {}
@@ -144,6 +257,8 @@ function panelHtml(webview: vscode.Webview): string {
 
     img.addEventListener('pointerup', (ev) => endPointer(ev, 'touchUp'));
     img.addEventListener('pointercancel', (ev) => endPointer(ev, 'touchCancel'));
+
+    vscode.postMessage({ type: 'panelReady' });
   </script>
 </body>
 </html>`;
@@ -189,6 +304,10 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
         );
         if (ok && padLeft + padRight < 1 && padTop + padBottom < 1) {
           streamPads = { padLeft, padRight, padTop, padBottom };
+          activePanel?.webview.postMessage({
+            type: "streamMap",
+            pads: { padLeft, padRight, padTop, padBottom },
+          });
         }
       } catch {
         /* ignore malformed MAP */
@@ -265,12 +384,154 @@ function normalizedHit(
   return { nx, ny };
 }
 
-function spawnTouch(bin: string, touchArgs: string[], env: NodeJS.ProcessEnv) {
+function fmtRat(n: number): string {
+  return n.toFixed(6);
+}
+
+function touchDebugEnabled(): boolean {
+  return !!vscode.workspace.getConfiguration("ios-simulator-embed").get<boolean>("debugTouches");
+}
+
+function logTouchDebug(
+  phase: string,
+  m: { x: number; y: number; w: number; h: number },
+  hit: { nx: number; ny: number }
+) {
+  if (!touchDebugEnabled()) {
+    return;
+  }
+  const x0 = m.x / m.w;
+  const y0 = m.y / m.h;
+  const { padLeft, padRight, padTop, padBottom } = streamPads;
+  debugOutputChannel.appendLine(
+    `[touch ${phase}] img (${m.x.toFixed(1)}, ${m.y.toFixed(1)}) / (${m.w.toFixed(1)}×${m.h.toFixed(1)})  ` +
+      `inImage (${x0.toFixed(4)}, ${y0.toFixed(4)})  MAP L,R,T,B (${padLeft.toFixed(4)}, ${padRight.toFixed(4)}, ${padTop.toFixed(4)}, ${padBottom.toFixed(4)})  ` +
+      `→ device (${hit.nx.toFixed(6)}, ${hit.ny.toFixed(6)})`
+  );
+}
+
+function ensureTouchSession(bin: string, env: NodeJS.ProcessEnv): boolean {
+  if (touchSessionChild && !touchSessionChild.killed) {
+    return true;
+  }
+  stopTouchSession();
   try {
-    const p = cp.spawn(bin, ["touch", ...touchArgs], { stdio: "ignore", detached: true, env });
-    p.unref();
+    const child = cp.spawn(bin, ["touch", "sess"], { stdio: ["pipe", "pipe", "pipe"], env });
+    touchSessionChild = child;
+    touchSessionStderrBuf = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      touchSessionStderrBuf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = touchSessionStderrBuf.indexOf("\n")) >= 0) {
+        const line = touchSessionStderrBuf.slice(0, nl).trimEnd();
+        touchSessionStderrBuf = touchSessionStderrBuf.slice(nl + 1);
+        if (line.startsWith("ERR:")) {
+          debugOutputChannel.appendLine(`[touch session] ${line}`);
+          if (touchDebugEnabled()) {
+            debugOutputChannel.show(true);
+          }
+        }
+      }
+    });
+    child.on("error", (e) => {
+      void vscode.window.showErrorMessage(`Touch session failed to start: ${String(e)}`);
+    });
+    child.on("exit", () => {
+      touchSessionChild = undefined;
+      panelTouchActive = false;
+    });
+    return true;
   } catch {
-    /* ignore */
+    return false;
+  }
+}
+
+function sendTouchSessionLine(line: string) {
+  if (!touchSessionChild?.stdin?.writable) {
+    return;
+  }
+  touchSessionChild.stdin.write(`${line}\n`);
+}
+
+function simDeviceArg(): string {
+  const u = vscode.workspace.getConfiguration("ios-simulator-embed").get<string>("simulatorUdid")?.trim();
+  return u && u.length > 0 ? u : "booted";
+}
+
+async function runChromeAction(context: vscode.ExtensionContext, action: string) {
+  switch (action) {
+    case "screenshot": {
+      const dev = simDeviceArg();
+      try {
+        const png = cp.execFileSync("xcrun", ["simctl", "io", dev, "screenshot", "-", "--type=png"], {
+          maxBuffer: 32 * 1024 * 1024,
+        });
+        const name = `simulator-screenshot-${Date.now()}.png`;
+        const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const target = folder
+          ? vscode.Uri.joinPath(folder, name)
+          : vscode.Uri.joinPath(context.globalStorageUri, name);
+        if (!folder) {
+          try {
+            await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+          } catch {
+            /* directory may already exist */
+          }
+        }
+        await vscode.workspace.fs.writeFile(target, png);
+        const pick = await vscode.window.showInformationMessage(
+          `Saved simulator screenshot (${dev}).`,
+          "Reveal in Finder",
+          "Copy path"
+        );
+        if (pick === "Reveal in Finder") {
+          await vscode.commands.executeCommand("revealFileInOS", target);
+        } else if (pick === "Copy path") {
+          await vscode.env.clipboard.writeText(target.fsPath);
+        }
+      } catch (e) {
+        void vscode.window.showErrorMessage(`simctl screenshot failed: ${String(e)}`);
+      }
+      break;
+    }
+    case "home": {
+      const args = [
+        "-e",
+        'tell application "Simulator" to activate',
+        "-e",
+        "delay 0.2",
+        "-e",
+        'tell application "System Events" to keystroke "h" using {command down, shift down}',
+      ];
+      cp.execFile("osascript", args, (err) => {
+        if (err) {
+          void vscode.window.showErrorMessage(
+            `Home shortcut failed. Grant Accessibility to this app for “System Events”, or press ⌘⇧H in Simulator. ${String(err)}`
+          );
+        }
+      });
+      break;
+    }
+    case "rotate": {
+      const args = [
+        "-e",
+        'tell application "Simulator" to activate',
+        "-e",
+        "delay 0.2",
+        "-e",
+        'tell application "System Events" to key code 124 using command down',
+      ];
+      cp.execFile("osascript", args, (err) => {
+        if (err) {
+          void vscode.window.showErrorMessage(
+            `Rotate failed. Grant Accessibility for “System Events”, or use ⌘← / ⌘→ in Simulator. ${String(err)}`
+          );
+        }
+      });
+      break;
+    }
+    default:
+      break;
   }
 }
 
@@ -315,6 +576,20 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(debugOutputChannel);
 
   context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration("ios-simulator-embed.debugTouches") || !activePanel) {
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+      activePanel.webview.postMessage({
+        type: "init",
+        debugTouches: !!cfg.get("debugTouches"),
+        streamPads: { ...streamPads },
+      });
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("ios-simulator-embed.openPanel", () => {
       if (activePanel) {
         activePanel.reveal(vscode.ViewColumn.Two);
@@ -335,14 +610,27 @@ export function activate(context: vscode.ExtensionContext) {
           if (!msg || typeof msg !== "object") {
             return;
           }
-          const m = msg as {
-            type?: string;
-            button?: number;
-            x?: number;
-            y?: number;
-            w?: number;
-            h?: number;
-          };
+          const m = msg as Record<string, unknown>;
+
+          if (m.type === "panelReady") {
+            const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+            panel.webview.postMessage({
+              type: "init",
+              debugTouches: !!cfg.get("debugTouches"),
+              streamPads: { ...streamPads },
+            });
+            return;
+          }
+
+          if (m.type === "chrome" && typeof m.action === "string") {
+            void runChromeAction(context, m.action);
+            return;
+          }
+
+          const mt = m.type;
+          if (mt !== "touchDown" && mt !== "touchMove" && mt !== "touchUp" && mt !== "touchCancel") {
+            return;
+          }
           if (
             typeof m.x !== "number" ||
             typeof m.y !== "number" ||
@@ -351,20 +639,30 @@ export function activate(context: vscode.ExtensionContext) {
           ) {
             return;
           }
+          const px = m.x;
+          const py = m.y;
+          const pw = m.w;
+          const ph = m.h;
           const bin = ensureHelperBuilt(context);
           if (!bin) {
             return;
           }
           const env = helperEnvForCapture();
-          const hit = normalizedHit(m.x, m.y, m.w, m.h);
+          const hit = normalizedHit(px, py, pw, ph);
           if (!hit) {
             return;
           }
+          const coords = { x: px, y: py, w: pw, h: ph };
 
           if (m.type === "touchDown" && m.button === 0) {
+            if (!ensureTouchSession(bin, env)) {
+              void vscode.window.showErrorMessage("Could not start HID touch session; rebuild the native helper (npm run build:native).");
+              return;
+            }
             panelTouchActive = true;
             panelTouchLastMoveMs = 0;
-            spawnTouch(bin, ["down", String(hit.nx), String(hit.ny)], env);
+            logTouchDebug("down", coords, hit);
+            sendTouchSessionLine(`d ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
             return;
           }
           if (m.type === "touchMove" && panelTouchActive) {
@@ -373,12 +671,14 @@ export function activate(context: vscode.ExtensionContext) {
               return;
             }
             panelTouchLastMoveMs = now;
-            spawnTouch(bin, ["move", String(hit.nx), String(hit.ny)], env);
+            logTouchDebug("move", coords, hit);
+            sendTouchSessionLine(`m ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
             return;
           }
           if ((m.type === "touchUp" || m.type === "touchCancel") && panelTouchActive) {
             panelTouchActive = false;
-            spawnTouch(bin, ["up", String(hit.nx), String(hit.ny)], env);
+            logTouchDebug(m.type === "touchUp" ? "up" : "cancel", coords, hit);
+            sendTouchSessionLine(`u ${fmtRat(hit.nx)} ${fmtRat(hit.ny)}`);
           }
         },
         undefined,
