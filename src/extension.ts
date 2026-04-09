@@ -122,9 +122,9 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
-  <div id="hint">Streamed Simulator. Drag to scroll uses one HID session. Toolbar icons: home, screenshot (<code>simctl</code>), rotate — Home/Rotate use Simulator + Accessibility. Enable <code>debugTouches</code> for coordinates. Set <code>simulatorUdid</code> if MAP stays zero or touches target the wrong device.</div>
+  <div id="hint">Streamed Simulator. Toolbar: home &amp; rotate briefly activate Simulator to send a shortcut, then restore the editor; screenshot uses <code>simctl</code> only. Accessibility required for System Events. <code>debugTouches</code> for coordinates; <code>simulatorUdid</code> if MAP is wrong.</div>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
-    <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Activates Simulator.app.">
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="home" title="Hardware home (⌘⇧H). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Home</span>
       <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
     </button>
@@ -132,7 +132,7 @@ function panelHtml(webview: vscode.Webview): string {
       <span class="sr-only">Screenshot</span>
       <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
     </button>
-    <button type="button" class="chromeBtn chromeIconBtn" data-action="rotate" title="Rotate right (⌘→). Activates Simulator.app.">
+    <button type="button" class="chromeBtn chromeIconBtn" data-action="rotate" title="Rotate right (⌘→). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Rotate</span>
       <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1 2.12-9.36L23 10"/></svg>
     </button>
@@ -468,6 +468,52 @@ function simDeviceArg(): string {
   return u && u.length > 0 ? u : "booted";
 }
 
+/** Bundle id of the app that is frontmost now (call before activating Simulator). */
+function getFrontmostAppBundleIdSync(): string | undefined {
+  try {
+    const out = cp.execFileSync(
+      "osascript",
+      [
+        "-e",
+        'tell application "System Events" to get bundle identifier of first application process whose frontmost is true',
+      ],
+      { encoding: "utf8", timeout: 5000 }
+    );
+    const s = out.trim();
+    return s.length > 0 ? s : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Sends a keyboard shortcut while Simulator is briefly activated, then restores the previous front app.
+ * Avoids leaving Simulator on top after chrome toolbar actions.
+ */
+function runSimulatorHostShortcut(systemEventsCommand: string, errorLabel: string) {
+  const previousBundleId = getFrontmostAppBundleIdSync();
+  const args: string[] = [
+    "-e",
+    'tell application "Simulator" to activate',
+    "-e",
+    "delay 0.18",
+    "-e",
+    `tell application "System Events" to ${systemEventsCommand}`,
+  ];
+  if (previousBundleId) {
+    const esc = previousBundleId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    args.push("-e", "delay 0.06");
+    args.push("-e", `try\ntell application id "${esc}" to activate\nend try`);
+  }
+  cp.execFile("osascript", args, (err) => {
+    if (err) {
+      void vscode.window.showErrorMessage(
+        `${errorLabel} Grant Accessibility to this app for “System Events”, or run the shortcut in Simulator. ${String(err)}`
+      );
+    }
+  });
+}
+
 async function runChromeAction(context: vscode.ExtensionContext, action: string) {
   switch (action) {
     case "screenshot": {
@@ -505,39 +551,17 @@ async function runChromeAction(context: vscode.ExtensionContext, action: string)
       break;
     }
     case "home": {
-      const args = [
-        "-e",
-        'tell application "Simulator" to activate',
-        "-e",
-        "delay 0.2",
-        "-e",
-        'tell application "System Events" to keystroke "h" using {command down, shift down}',
-      ];
-      cp.execFile("osascript", args, (err) => {
-        if (err) {
-          void vscode.window.showErrorMessage(
-            `Home shortcut failed. Grant Accessibility to this app for “System Events”, or press ⌘⇧H in Simulator. ${String(err)}`
-          );
-        }
-      });
+      runSimulatorHostShortcut(
+        'keystroke "h" using {command down, shift down}',
+        "Hardware home (⌘⇧H) failed."
+      );
       break;
     }
     case "rotate": {
-      const args = [
-        "-e",
-        'tell application "Simulator" to activate',
-        "-e",
-        "delay 0.2",
-        "-e",
-        'tell application "System Events" to key code 124 using command down',
-      ];
-      cp.execFile("osascript", args, (err) => {
-        if (err) {
-          void vscode.window.showErrorMessage(
-            `Rotate failed. Grant Accessibility for “System Events”, or use ⌘← / ⌘→ in Simulator. ${String(err)}`
-          );
-        }
-      });
+      runSimulatorHostShortcut(
+        "key code 124 using command down",
+        "Rotate (⌘→) failed."
+      );
       break;
     }
     default:
