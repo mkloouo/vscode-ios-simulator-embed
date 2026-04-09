@@ -305,9 +305,14 @@ private func runTouchSession() async {
       break
     }
 
-    let errMsg: String? = await MainActor.run { () -> String? in
+    enum TouchSessOutcome {
+      case failure(String)
+      case success(tag: String, nx: Double, ny: Double)
+    }
+
+    let outcome: TouchSessOutcome = await MainActor.run { () -> TouchSessOutcome in
       guard let session = UnsafeMutableRawPointer(bitPattern: sessionBits) else {
-        return "session lost"
+        return .failure("session lost")
       }
       var err = [CChar](repeating: 0, count: 512)
       let phase: Int32
@@ -319,19 +324,36 @@ private func runTouchSession() async {
       case "m", "move":
         phase = 0
       default:
-        return "unknown command (use d|m|u|q)"
+        return .failure("unknown command (use d|m|u|q)")
       }
       guard parts.count == 3, let nx = Double(parts[1]), let ny = Double(parts[2]) else {
-        return "expected: d|m|u <nx> <ny>"
+        return .failure("expected: d|m|u <nx> <ny>")
       }
       guard IOSEmbedHIDSessionSend(session, nx, ny, phase, &err, err.count) else {
-        return String(cString: err)
+        return .failure(String(cString: err))
       }
-      return nil
+      let tag: String
+      switch cmd {
+      case "d", "down": tag = "d"
+      case "m", "move": tag = "m"
+      case "u", "up": tag = "u"
+      default: tag = String(cmd.prefix(1))
+      }
+      return .success(tag: tag, nx: nx, ny: ny)
     }
-    if let errMsg {
+
+    switch outcome {
+    case .failure(let errMsg):
       FileHandle.standardError.write(Data("ERR:\(errMsg)\n".utf8))
       fflush(stderr)
+    case .success(let tag, let nx, let ny):
+      let touchDbg = ProcessInfo.processInfo.environment["IOS_SIM_HELPER_TOUCH_DEBUG"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+      if touchDbg == "1" || touchDbg == "true" || touchDbg == "yes" {
+        let okLine = "OK:\(tag) \(nx) \(ny)\n"
+        FileHandle.standardError.write(Data(okLine.utf8))
+        fflush(stderr)
+      }
     }
   }
 }
