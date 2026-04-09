@@ -58,6 +58,13 @@ function helperEnvForCapture(): NodeJS.ProcessEnv {
   if (cfg.get<boolean>("debugTouchPipeline")) {
     env.IOS_SIM_HELPER_TOUCH_DEBUG = "1";
   }
+  const jq = cfg.get<number>("streamJpegQuality");
+  if (typeof jq === "number" && Number.isFinite(jq)) {
+    const q = Math.min(1, Math.max(0.25, jq));
+    env.IOS_SIM_HELPER_JPEG_QUALITY = String(q);
+  } else {
+    env.IOS_SIM_HELPER_JPEG_QUALITY = "0.62";
+  }
   return env;
 }
 
@@ -87,6 +94,32 @@ function streamPanelInitPayload(): StreamPanelInitPayload {
   };
 }
 
+function isMacOSHost(): boolean {
+  return process.platform === "darwin";
+}
+
+/** AppleScript `delay` in seconds; clamped for stability. */
+function appleScriptDelaySeconds(ms: number): string {
+  const sec = Math.max(0.02, Math.min(2.5, ms / 1000));
+  return sec.toFixed(3);
+}
+
+function homeChromeTimingFromConfig() {
+  const c = vscode.workspace.getConfiguration("ios-simulator-embed");
+  const clamp = (key: string, def: number, lo: number, hi: number) => {
+    const v = c.get<number>(key);
+    const n = typeof v === "number" && Number.isFinite(v) ? v : def;
+    return Math.round(Math.min(hi, Math.max(lo, n)));
+  };
+  return {
+    singleWaitMs: clamp("homeToolbarSingleWaitMs", 260, 80, 900),
+    doubleFlushMs: clamp("homeToolbarDoubleFlushMs", 42, 15, 300),
+    afterActivateMs: clamp("homeAfterSimulatorActivateMs", 120, 40, 500),
+    betweenDoubleKeyMs: clamp("homeBetweenDoubleHomeKeyMs", 200, 100, 600),
+    beforeRestoreMs: clamp("homeBeforeRestoreFocusMs", 90, 40, 500),
+  };
+}
+
 function logMapDiag(message: string, reveal: boolean) {
   debugOutputChannel.appendLine(message);
   if (reveal && mapDebugEnabled()) {
@@ -95,14 +128,13 @@ function logMapDiag(message: string, reveal: boolean) {
 }
 
 function helperPath(context: vscode.ExtensionContext): string {
-  return path.join(
-    context.extensionPath,
-    "native",
-    "ios-sim-helper",
-    ".build",
-    "release",
-    "ios-sim-helper"
-  );
+  const base = path.join(context.extensionPath, "native", "ios-sim-helper");
+  const fromBuild = path.join(base, ".build", "release", "ios-sim-helper");
+  const fromDist = path.join(base, "dist", "ios-sim-helper");
+  if (fs.existsSync(fromBuild)) {
+    return fromBuild;
+  }
+  return fromDist;
 }
 
 function ensureHelperBuilt(context: vscode.ExtensionContext): string | undefined {
@@ -167,13 +199,15 @@ function panelHtml(webview: vscode.Webview): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     body { margin: 0; padding: 8px; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: var(--vscode-font-family); }
-    #chromeBar { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; padding: 6px 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent); border-radius: 6px; max-width: 100%; box-sizing: border-box; }
+    /* Keeps hint + toolbar + stream the same width as the image (see streamMaxWidthPx). */
+    .stream-column { display: block; width: 100%; max-width: 100%; box-sizing: border-box; }
+    #chromeBar { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; padding: 6px 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent); border-radius: 6px; width: 100%; max-width: 100%; box-sizing: border-box; }
     .chromeBtn { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid color-mix(in srgb, var(--vscode-editor-foreground) 25%, transparent); background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
     .chromeBtn:hover { filter: brightness(1.08); }
-    .chromeIconBtn { padding: 8px; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+    .chromeIconBtn { padding: 8px; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; line-height: 0; }
     .chromeIconBtn svg { display: block; flex-shrink: 0; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    #wrap { position: relative; display: inline-block; max-width: 100%; box-sizing: border-box; }
+    #wrap { position: relative; display: block; width: 100%; max-width: 100%; box-sizing: border-box; }
     #frame { display: block; width: auto; height: auto; max-width: 100%; cursor: pointer; user-select: none; touch-action: none; background: #111; box-sizing: border-box; }
     .hint-compact { font-size: 12px; opacity: 0.8; margin: 0 0 8px 0; line-height: 1.35; }
     #hintDetails { font-size: 12px; margin-bottom: 8px; line-height: 1.35; }
@@ -185,6 +219,7 @@ function panelHtml(webview: vscode.Webview): string {
   </style>
 </head>
 <body>
+  <div id="streamColumn" class="stream-column">
   <p id="hintCompact" class="hint-compact"></p>
   <details id="hintDetails" hidden>
     <summary>MAP, touch debug, toolbar (optional)</summary>
@@ -205,17 +240,19 @@ function panelHtml(webview: vscode.Webview): string {
     </button>
     <button type="button" class="chromeBtn chromeIconBtn" data-action="rotate" title="Rotate right (⌘→). Briefly activates Simulator, then returns focus here.">
       <span class="sr-only">Rotate</span>
-      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1 2.12-9.36L23 10"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.219-8.56"/><path d="M21 3v6h-6"/></svg>
     </button>
   </div>
   <div id="wrap">
     <img id="frame" alt="Simulator stream" draggable="false" />
     <pre id="debugHud" hidden></pre>
   </div>
+  </div>
   <script nonce="streampanel">
     const vscode = acquireVsCodeApi();
     const img = document.getElementById('frame');
     const wrap = document.getElementById('wrap');
+    const streamColumn = document.getElementById('streamColumn');
     const hintCompact = document.getElementById('hintCompact');
     const hintDetails = document.getElementById('hintDetails');
     const debugHud = document.getElementById('debugHud');
@@ -228,9 +265,12 @@ function panelHtml(webview: vscode.Webview): string {
       const mw = layout.maxWidthPx;
       const mh = layout.maxHeightPx;
       if (typeof mw === 'number' && mw > 0) {
-        img.style.maxWidth = mw + 'px';
-        if (wrap) wrap.style.maxWidth = mw + 'px';
+        const cap = mw + 'px';
+        if (streamColumn) streamColumn.style.maxWidth = cap;
+        img.style.maxWidth = '100%';
+        if (wrap) wrap.style.maxWidth = '100%';
       } else {
+        if (streamColumn) streamColumn.style.maxWidth = '100%';
         img.style.maxWidth = '100%';
         if (wrap) wrap.style.maxWidth = '100%';
       }
@@ -814,12 +854,13 @@ function flushHomeChromeSchedule() {
  * Sends one or two ⌘⇧H presses in a single Simulator foreground session (required for app switcher).
  */
 function runSimulatorHomePresses(presses: 1 | 2) {
+  const t = homeChromeTimingFromConfig();
   const previousBundleId = getFrontmostAppBundleIdSync();
   const args: string[] = [
     "-e",
     'tell application "Simulator" to activate',
     "-e",
-    "delay 0.2",
+    `delay ${appleScriptDelaySeconds(t.afterActivateMs)}`,
   ];
   for (let i = 0; i < presses; i++) {
     args.push(
@@ -827,10 +868,10 @@ function runSimulatorHomePresses(presses: 1 | 2) {
       'tell application "System Events" to keystroke "h" using {command down, shift down}'
     );
     if (i < presses - 1) {
-      args.push("-e", "delay 0.3");
+      args.push("-e", `delay ${appleScriptDelaySeconds(t.betweenDoubleKeyMs)}`);
     }
   }
-  args.push("-e", "delay 0.15");
+  args.push("-e", `delay ${appleScriptDelaySeconds(t.beforeRestoreMs)}`);
   if (previousBundleId) {
     const esc = previousBundleId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     args.push("-e", `try\ntell application id "${esc}" to activate\nend try`);
@@ -850,11 +891,12 @@ function runSimulatorHomePresses(presses: 1 | 2) {
 
 /** Coalesce toolbar Home clicks: one click after idle → single home; two quick clicks → double home. */
 function scheduleSimulatorHomeToolbarClick() {
+  const t = homeChromeTimingFromConfig();
   homeChromeClickCount += 1;
   if (homeChromeTimer !== undefined) {
     clearTimeout(homeChromeTimer);
   }
-  const delay = homeChromeClickCount >= 2 ? 85 : 400;
+  const delay = homeChromeClickCount >= 2 ? t.doubleFlushMs : t.singleWaitMs;
   homeChromeTimer = setTimeout(() => {
     homeChromeTimer = undefined;
     const presses = (homeChromeClickCount >= 2 ? 2 : 1) as 1 | 2;
@@ -951,6 +993,12 @@ function runTouchMapDebugHelp() {
   );
   debugOutputChannel.appendLine(
     "• ios-simulator-embed.streamShowUsageHint — expandable MAP/debug help at the top of the stream panel."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.streamJpegQuality — JPEG quality for the stream (reopen panel after change)."
+  );
+  debugOutputChannel.appendLine(
+    "• ios-simulator-embed.homeToolbar* / homeAfter* / homeBetween* / homeBefore* — toolbar Home timing (ms)."
   );
   debugOutputChannel.appendLine("");
   debugOutputChannel.appendLine("Commands:");
@@ -1054,11 +1102,23 @@ export function activate(context: vscode.ExtensionContext) {
         );
         debugOutputChannel.show(true);
       }
+      if (e.affectsConfiguration("ios-simulator-embed.streamJpegQuality")) {
+        debugOutputChannel.appendLine(
+          "[stream] `streamJpegQuality` changed — stop and reopen the streamed panel so the capture helper restarts with IOS_SIM_HELPER_JPEG_QUALITY."
+        );
+        debugOutputChannel.show(true);
+      }
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("ios-simulator-embed.openPanel", () => {
+      if (!isMacOSHost()) {
+        void vscode.window.showErrorMessage(
+          "iOS Simulator stream requires macOS (ScreenCaptureKit and Simulator)."
+        );
+        return;
+      }
       if (activePanel) {
         activePanel.reveal(vscode.ViewColumn.Two);
         return;
@@ -1106,13 +1166,16 @@ export function activate(context: vscode.ExtensionContext) {
           const py = m.y;
           const pw = m.w;
           const ph = m.h;
+          if (![px, py, pw, ph].every((n) => Number.isFinite(n))) {
+            return;
+          }
           const bin = ensureHelperBuilt(context);
           if (!bin) {
             return;
           }
           const env = helperEnvForCapture();
           const hit = normalizedHit(px, py, pw, ph);
-          if (!hit) {
+          if (!hit || !Number.isFinite(hit.nx) || !Number.isFinite(hit.ny)) {
             return;
           }
           const coords = { x: px, y: py, w: pw, h: ph };
@@ -1171,6 +1234,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("ios-simulator-embed.listWindows", () => {
+      if (!isMacOSHost()) {
+        void vscode.window.showErrorMessage("List capture windows requires macOS.");
+        return;
+      }
       runListWindowsDebug(context);
     })
   );

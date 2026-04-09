@@ -4,5 +4,6 @@ src/**
 .gitignore
 **/tsconfig.json
 **/*.map
-native/**/.build/**
+native/ios-sim-helper/.build/**
+simulator-screenshot-*.png
 node_modules/**

@@ -73,6 +73,7 @@ enum HelperError: Error, CustomStringConvertible {
       Optional environment:
         IOS_SIM_HELPER_BUNDLE_ID=<id>            # stream: filter windows by owning bundle id
         IOS_SIM_UDID=<uuid>                      # touch / MAP: booted device UDID (if multiple simulators booted)
+        IOS_SIM_HELPER_JPEG_QUALITY=<0…1>      # stream: JPEG encoder quality (default 0.55 if unset/invalid)
       """
     case .noSimulatorWindow(let hint):
       return "No capture window found. \(hint)"
@@ -186,6 +187,16 @@ private func listCaptureCandidates() async throws {
 /// Reusing one `CIContext` avoids creating a new Metal/GL context every frame (big CPU/GPU win).
 private let sharedJPEGContext = CIContext(options: [.useSoftwareRenderer: false])
 
+private func jpegCompressionQuality() -> CGFloat {
+  let raw =
+    ProcessInfo.processInfo.environment["IOS_SIM_HELPER_JPEG_QUALITY"]?
+    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  guard let v = Double(raw), v >= 0, v <= 1 else {
+    return 0.55
+  }
+  return CGFloat(v)
+}
+
 private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
   guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
   let ciImage = CIImage(cvPixelBuffer: buffer)
@@ -195,7 +206,9 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
     let dest = CGImageDestinationCreateWithData(
       data as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil)
   else { return nil }
-  let props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.55]
+  let props: [CFString: Any] = [
+    kCGImageDestinationLossyCompressionQuality: jpegCompressionQuality()
+  ]
   CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
   guard CGImageDestinationFinalize(dest) else { return nil }
   return data as Data

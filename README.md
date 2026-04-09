@@ -1,6 +1,8 @@
 # iOS Simulator (streamed panel)
 
-VS Code / Cursor extension for **macOS** that streams the iOS Simulator window into a webview via **ScreenCaptureKit** and sends **taps** with **SimulatorKit Indigo HID** (private SPI), so touches reach the booted simulator even when its window is **behind other apps**.
+**macOS only.** This extension does not run on Linux or Windows.
+
+VS Code / Cursor extension that streams the iOS Simulator window into a webview via **ScreenCaptureKit** and sends **taps** with **SimulatorKit Indigo HID** (private SPI), so touches reach the booted simulator even when its window is **behind other apps**.
 
 This is not true window embedding; it is a live JPEG stream plus host-side HID injection.
 
@@ -38,7 +40,7 @@ This is not true window embedding; it is a live JPEG stream plus host-side HID i
 ## macOS permissions
 
 - **Screen Recording**: allow the app that hosts the Extension Host (Cursor / VS Code) for capture.
-- **Accessibility** is **not** required for Indigo taps (unlike older `CGEvent` injection).
+- **Accessibility** (Automation): **not** required for stream touches (Indigo HID), but **required** for the panel toolbar shortcuts (Home, Rotate) which drive **Simulator** via **System Events** / AppleScript. **Screenshot** uses `simctl` only.
 
 ## Private API / stability
 
@@ -46,8 +48,8 @@ Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator u
 
 ## Limits
 
-- **Performance**: ~12 FPS capture + coalesced webview updates; still CPU-heavy.
-- **Packaging**: `.vscodeignore` excludes `native/**/.build`; ship a prebuilt `ios-sim-helper` per arch with the same rpath or an installer that sets `DYLD_FRAMEWORK_PATH` (discouraged for Gatekeeper).
+- **Performance**: ~12 FPS capture + coalesced webview updates; still CPU-heavy. Use setting **streamJpegQuality** to trade quality vs bandwidth.
+- **Packaging**: `vscode:prepublish` runs `scripts/stage-native-helper.sh`, which copies `.build/release/ios-sim-helper` into `native/ios-sim-helper/dist/` (the VSIX includes `dist` and ignores SwiftPM `.build`). Run **`npm run build:native`** before **`vsce package`**. Ship **arm64** (and **x86_64** if you build a universal binary) for your users’ Macs.
 
 ## Native helper CLI
 
@@ -56,3 +58,7 @@ Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator u
 - `stream` — stderr `BOUNDS:…`, stdout length-prefixed JPEG. Env `IOS_SIM_HELPER_BUNDLE_ID` optional.
 - `touch tap <nx> <ny>` — Indigo tap; `nx`,`ny` in `[0,1]` from top-left of the simulated display. Env `IOS_SIM_UDID` optional.
 - `list` — NDJSON of shareable macOS windows (debug bundle IDs for streaming).
+
+## License
+
+Copyright 2026 Mykola Odnosumov. Licensed under the **Apache License 2.0** (see [`LICENSE`](LICENSE)). Portions of the native helper are derived from Meta [idb](https://github.com/facebook/idb) (MIT); see [`native/ios-sim-helper/THIRD_PARTY.md`](native/ios-sim-helper/THIRD_PARTY.md).

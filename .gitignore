@@ -3,3 +3,5 @@ out
 *.vsix
 .DS_Store
 native/ios-sim-helper/.build
+native/ios-sim-helper/dist
+simulator-screenshot-*.png

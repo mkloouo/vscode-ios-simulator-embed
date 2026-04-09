@@ -1,14 +1,25 @@
 {
   "name": "ios-simulator-embed",
   "displayName": "iOS Simulator (streamed panel)",
-  "description": "Stream the iOS Simulator into a VS Code webview and forward pointer input (macOS, ScreenCaptureKit).",
+  "description": "macOS only: stream the iOS Simulator into a VS Code webview (ScreenCaptureKit) and forward touches (SimulatorKit Indigo HID).",
   "version": "0.1.0",
-  "publisher": "local",
+  "publisher": "mkloouo",
+  "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "keywords": [
+    "iOS",
+    "Simulator",
+    "ScreenCaptureKit",
+    "mobile",
+    "macOS"
   ],
   "activationEvents": [
     "onCommand:ios-simulator-embed.openPanel",
@@ -86,12 +97,54 @@
           "type": "boolean",
           "default": false,
           "description": "Show the expandable MAP / debug / toolbar help block at the top of the stream panel. When false, only a one-line reminder is shown."
+        },
+        "ios-simulator-embed.streamJpegQuality": {
+          "type": "number",
+          "default": 0.62,
+          "minimum": 0.25,
+          "maximum": 1,
+          "description": "JPEG quality (0–1) for ScreenCaptureKit frames. Higher = sharper and larger. Reopen the streamed panel after changing."
+        },
+        "ios-simulator-embed.homeToolbarSingleWaitMs": {
+          "type": "number",
+          "default": 260,
+          "minimum": 80,
+          "maximum": 900,
+          "description": "After one Home toolbar click, wait this long (ms) before sending a single ⌘⇧H if no second click arrives."
+        },
+        "ios-simulator-embed.homeToolbarDoubleFlushMs": {
+          "type": "number",
+          "default": 42,
+          "minimum": 15,
+          "maximum": 300,
+          "description": "After a second Home click (double-press), wait this long (ms) before sending two ⌘⇧H presses."
+        },
+        "ios-simulator-embed.homeAfterSimulatorActivateMs": {
+          "type": "number",
+          "default": 120,
+          "minimum": 40,
+          "maximum": 500,
+          "description": "AppleScript delay (ms) after activating Simulator before the first ⌘⇧H."
+        },
+        "ios-simulator-embed.homeBetweenDoubleHomeKeyMs": {
+          "type": "number",
+          "default": 200,
+          "minimum": 100,
+          "maximum": 600,
+          "description": "Delay (ms) between the two ⌘⇧H key events when performing a double home (app switcher)."
+        },
+        "ios-simulator-embed.homeBeforeRestoreFocusMs": {
+          "type": "number",
+          "default": 90,
+          "minimum": 40,
+          "maximum": 500,
+          "description": "AppleScript delay (ms) after the last ⌘⇧H before returning focus to the previous app."
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && bash scripts/stage-native-helper.sh",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "build:native": "bash native/ios-sim-helper/build.sh"
