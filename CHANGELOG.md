@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-04-09
+
+### Fixed
+
+- **Modifier chords** (e.g. **⌃⌥Z** or **⌃⌘Z**): webview forwards when **`event.code`** is a known physical key (`KeyA`–`KeyZ`, digits, space, specials), not only when `event.key.length === 1` — fixes empty / control / multi-character `key` values from macOS.
+- HID **modifier key-up order** matched **key-down order** incorrectly (using `unshift`), so multi-modifier shortcuts could fail; now press **⌘ → Ctrl → Alt → Shift** and release the **exact reverse** (fixes **⌃⌘** combinations like ⌃⌘Z).
+
+### Notes
+
+- If a chord never reaches the simulator, check **Keyboard Shortcuts** for a host binding on the same keys (documented in README).
+
+## [1.3.1] - 2026-04-09
+
+### Changed
+
+- **Keyboard UX** — Removed the separate ⌨ control. Typing arms on the **first pointer down on the stream image** and turns off when the webview **loses focus**, the document is **hidden**, or the panel tab becomes **inactive** (`onDidChangeViewState`). Pending character buffer is discarded on deactivate (no partial word sent after you click away).
+
+## [1.3.0] - 2026-04-09
+
+### Changed
+
+- **⌨ Keyboard strip** no longer uses AppleScript / Accessibility. Keys are mapped to **USB HID usage** values and sent with **`IndigoHIDMessageForKeyboardArbitrary`** on the **same `touch sess` session** as pointer events (`kp` / `kd` / `ku` stdin lines). Behaves like touches: works when Simulator is not frontmost and tracks **Spaces** like stream/touch.
+
+### Added
+
+- `IOSEmbedHIDSessionSendKeyboard` in the native helper; `touch sess` accepts `kd`, `ku`, `kp` with decimal or `0x` hex usages.
+- `src/hidKeyboard.ts` — `ev.code` and ASCII batch mapping for common keys and modifiers.
+
+## [1.2.0] - 2026-04-09
+
+### Added
+
+- **Keyboard strip (⌨)** on the streamed panel: click to focus, then type — keys are forwarded to the booted simulator using **AppleScript** / **System Events** (activate Simulator, keystroke, restore the previous front app). Printable text is batched briefly to reduce round-trips. Arrows, Tab, Return, Escape, delete, Home/End, page keys, F1–F12, and modifier+key chords are supported where the webview delivers the events.
+- Setting **`forwardSimulatorKeys`** (default on) hides the strip when disabled.
+
+### Notes
+
+- Host shortcuts may still consume some key chords before the webview sees them. Hardware keyboard layout must match what you expect in the simulator.
+
 ## [1.1.0] - 2026-04-09
 
 ### Added

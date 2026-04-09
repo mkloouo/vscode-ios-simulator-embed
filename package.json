@@ -1,8 +1,8 @@
 {
   "name": "ios-simulator-embed",
   "displayName": "iOS Simulator (streamed panel)",
-  "description": "macOS only: stream the iOS Simulator into a VS Code webview (ScreenCaptureKit) and forward touches (SimulatorKit Indigo HID).",
-  "version": "1.1.0",
+  "description": "macOS only: stream the iOS Simulator into a VS Code webview (ScreenCaptureKit), forward touches and keyboard (Indigo HID), optional toolbar via AppleScript.",
+  "version": "1.3.2",
   "publisher": "mkloouo",
   "license": "Apache-2.0",
   "repository": {
@@ -74,6 +74,11 @@
           "type": "string",
           "default": "",
           "description": "Booted simulator UDID for MAP, Indigo touch, and toolbar screenshot (`simctl`). Leave empty to let the helper/simctl pick among booted devices. Set via command “Select booted simulator (UDID)” or manually."
+        },
+        "ios-simulator-embed.forwardSimulatorKeys": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow keyboard forwarding: after you press on the stream image, keys go to the simulator via Indigo HID (same session as touches). Stops when the panel loses focus. Toolbar shortcuts still use AppleScript."
         },
         "ios-simulator-embed.debugTouches": {
           "type": "boolean",

@@ -50,13 +50,17 @@ Screen recording converted to GIF (first ~28s, 720px wide). Streamed panel with 
 ## macOS permissions
 
 - **Screen Recording**: allow the app that hosts the Extension Host (Cursor / VS Code) for capture.
-- **Accessibility** (Automation): **not** required for stream touches (Indigo HID), but **required** for the panel toolbar shortcuts (Home, Rotate) which drive **Simulator** via **System Events** / AppleScript. **Screenshot** uses `simctl` only.
+- **Accessibility** (Automation): **not** required for stream **touches** or **⌨ keyboard** input (both use Indigo HID). **Required** for the panel toolbar shortcuts **Home** and **Rotate** (AppleScript / System Events). **Screenshot** uses `simctl` only.
+
+**Keyboard** — **Tap the streamed image once** (same as starting a touch); after that, keys are translated to **USB HID usage** codes and sent on the same `touch sess` Indigo pipe as drags/taps. Typing is disabled when the panel **loses focus** (click elsewhere, switch tabs, hide the webview). Turn off **`ios-simulator-embed.forwardSimulatorKeys`** to disable forwarding. Layout is US‑centric; some punctuation and IME composition are limited.
+
+**Chords (e.g. ⌃⌥Z, ⌃⌘Z)** — The webview uses **`event.code`** (physical key) for modifier shortcuts because macOS often reports a non-printable or odd `event.key`. HID sends modifiers in **⌘ → Ctrl → Alt → Shift** order and releases in **reverse**, which matters for multi-modifier shortcuts. If a chord still does nothing, **Electron may still consume it** (even with no VS Code binding): try another chord or file an issue with your host app version.
 
 ## Spaces (Mission Control / virtual desktops)
 
 ScreenCaptureKit only sees windows on the **same Space** as the app that runs the extension host (Cursor / VS Code). If the Simulator window is on **another desktop**, **start the stream will not capture it** until you move Simulator to the desktop where the editor is, then run **Start streamed panel** again.
 
-After capture has started successfully, you can **move Simulator to another Space**; the **stream and touch forwarding** usually keep working. The **three toolbar buttons** (Home, Screenshot, Rotate) **may stop working** in that situation: they rely on bringing the **on-screen** Simulator window to the front via AppleScript / `simctl`, which targets the Simulator instance on the **current** Space, not necessarily the one you are streaming.
+After capture has started successfully, you can **move Simulator to another Space**; the **stream**, **touches**, and **⌨ keyboard** (Indigo HID) usually keep working. The **three toolbar buttons** (Home, Screenshot, Rotate) **may stop working** in that situation: they rely on bringing the **on-screen** Simulator window to the front via AppleScript / `simctl`, which targets the Simulator instance on the **current** Space, not necessarily the one you are streaming.
 
 ## Private API / stability
 
@@ -73,6 +77,7 @@ Touch uses **undocumented** Apple frameworks and wire formats; Xcode/Simulator u
 
 - `stream` — stderr `BOUNDS:…`, stdout length-prefixed JPEG. Env `IOS_SIM_HELPER_BUNDLE_ID` optional.
 - `touch tap <nx> <ny>` — Indigo tap; `nx`,`ny` in `[0,1]` from top-left of the simulated display. Env `IOS_SIM_UDID` optional.
+- `touch sess` — stdin: `d|m|u nx ny` (touch) and `kp|kd|ku <hidUsage>` (USB HID keyboard page 0x07), one shared `SimDeviceLegacyHIDClient`.
 - `list` — NDJSON of shareable macOS windows (debug bundle IDs for streaming).
 
 ## Extension icon
