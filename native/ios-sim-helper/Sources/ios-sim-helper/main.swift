@@ -1,3 +1,25 @@
+// =============================================================================
+// ios-sim-helper — small macOS command-line tool for the VS Code extension
+// =============================================================================
+//
+// Two modes (chosen by the first argument):
+//   stream — finds the Simulator window, captures it with ScreenCaptureKit, and
+//            writes JPEG frames to stdout (length-prefixed). Sends one BOUNDS
+//            line on stderr so the extension can map clicks to screen coords.
+//   click  — synthesizes a left click at Quartz global (x, y).
+//
+// The extension spawns this binary; it is not a .app bundle, so we must
+// explicitly connect to the Window Server (see connectToWindowServer).
+//
+// Swift notes (if you are new to the language):
+//   • `async` / `await` — asynchronous functions; `await` suspends until done.
+//   • `throws` / `try` — functions that can fail with an Error; caller uses try.
+//   • `guard` — early exit unless a condition holds (keeps “happy path” unindented).
+//   • `?` after a type — optional (may be nil); `??` supplies a default if nil.
+//   • `@MainActor` — run this code on the main UI thread (required for much of AppKit).
+//   • `final class` — class that cannot be subclassed; NSObject is Apple’s Obj‑C base.
+// =============================================================================
+
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -8,6 +30,25 @@ import ImageIO
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 
+// MARK: - Window Server bootstrap
+
+/// Hooks this process into macOS’s graphics/window system (“Window Server”).
+///
+/// A normal .app does this automatically. A bare CLI executable does not—but
+/// ScreenCaptureKit and many CoreGraphics calls still require it. If we skip this,
+/// you can get `CGS_REQUIRE_INIT` assertions inside Apple’s frameworks.
+///
+/// `NSApplication.shared` creates the singleton app object; `.accessory` means we
+/// behave like a background helper (no dock icon, no menu bar app requirement).
+private func connectToWindowServer() {
+  let app = NSApplication.shared
+  app.setActivationPolicy(.accessory)
+}
+
+// MARK: - Errors
+
+/// Simple error type we can print or throw. `CustomStringConvertible` means it
+/// stringifies for `"\(error)"` via the `description` property.
 enum HelperError: Error, CustomStringConvertible {
   case usage
   case noSimulatorWindow
@@ -25,17 +66,35 @@ enum HelperError: Error, CustomStringConvertible {
   }
 }
 
+// MARK: - Finding the Simulator window
+
+/// Asks ScreenCaptureKit for every on-screen window, then picks the Simulator.
+///
+/// `@MainActor` forces this to run on the main thread. Apple’s capture APIs expect
+/// UI-thread affinity in practice; the VS Code–spawned CLI would otherwise skip
+/// normal app startup, so we pair this with `connectToWindowServer()`.
+///
+/// `async throws` means: may suspend (await) and may fail (`throw`); callers use
+/// `try await`.
+@MainActor
 private func findSimulatorWindow() async throws -> SCWindow {
+  // Snapshot of shareable content: windows, displays, apps (async system call).
   let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+
+  // Heuristic filters: bundle IDs Apple uses for Simulator, plus title patterns
+  // (e.g. “main — iOS …” when the device name is “main”).
   let candidates = content.windows.filter { window in
     let bid = window.owningApplication?.bundleIdentifier ?? ""
     if bid == "com.apple.iphonesimulator" { return true }
     if bid.contains("CoreSimulator") { return true }
     if bid.contains("Simulator") { return true }
     let title = window.title ?? ""
-    if title.contains("iOS"), title.contains("—") || title.contains("-") { return true }
+    // Comma between conditions = logical AND. The `||` group matches common title shapes.
+    if title.contains("iOS"), title.contains("—") || title.contains("-") || title.contains("main") { return true }
     return false
   }
+
+  // Ignore tiny helper windows (icons, chrome); keep anything reasonably large.
   let sized = candidates.filter { $0.frame.width >= 120 && $0.frame.height >= 120 }
   func area(_ w: SCWindow) -> CGFloat { w.frame.width * w.frame.height }
   guard let best = sized.max(by: { area($0) < area($1) })
@@ -45,6 +104,12 @@ private func findSimulatorWindow() async throws -> SCWindow {
   return best
 }
 
+// MARK: - Frame encoding (video sample → JPEG bytes)
+
+/// Converts one video frame (`CMSampleBuffer`) from the capture pipeline into JPEG `Data`.
+///
+/// Pipeline: pixel buffer → Core Image → `CGImage` → ImageIO JPEG encoder.
+/// We compress a bit (0.72) to keep bandwidth reasonable for the extension/webview.
 private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
   guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
   let ciImage = CIImage(cvPixelBuffer: buffer)
@@ -61,6 +126,13 @@ private func jpegData(from sampleBuffer: CMSampleBuffer) -> Data? {
   return data as Data
 }
 
+// MARK: - Synthetic click
+
+/// Posts a left mouse down + up at the given point in **Quartz global coordinates**
+/// (origin bottom-left of the combined desktop space, as used by `CGEvent`).
+///
+/// The TypeScript side maps from webview/image coordinates into this space using
+/// the BOUNDS line emitted on stderr.
 private func postClick(quartzGlobal: CGPoint) {
   let down = CGEvent(
     mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: quartzGlobal,
@@ -69,12 +141,19 @@ private func postClick(quartzGlobal: CGPoint) {
     mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: quartzGlobal,
     mouseButton: .left)
   down?.post(tap: .cghidEventTap)
-  usleep(8_000)
+  usleep(8_000)  // tiny gap so the OS sees distinct down/up
   up?.post(tap: .cghidEventTap)
 }
 
+// MARK: - ScreenCaptureKit delegate
+
+/// Receives `CMSampleBuffer` frames from `SCStream` (ScreenCaptureKit’s capture object).
+///
+/// `NSObject` + `SCStreamOutput` is the Objective‑C “delegate/protocol” pattern Swift inherits.
+/// Apple calls `stream(_:didOutputSampleBuffer:of:)` on the queue we pass when adding this output.
 final class StreamOutput: NSObject, SCStreamOutput {
   let onFrame: (Data) -> Void
+  /// Serial queue so we don’t encode JPEG or touch stdout from multiple threads at once.
   private let queue = DispatchQueue(label: "ios-sim-helper.frames", qos: .userInitiated)
 
   init(onFrame: @escaping (Data) -> Void) {
@@ -91,6 +170,14 @@ final class StreamOutput: NSObject, SCStreamOutput {
   }
 }
 
+// MARK: - Stream mode (wire protocol: stderr BOUNDS, stdout length + JPEG)
+
+/// Configures and runs capture until stdin closes (parent process kill/dispose).
+///
+/// Protocol for the Node extension:
+///   1. One line on stderr: `BOUNDS:{...json...}\n` with window frame (for click mapping).
+///   2. Repeated on stdout: 4-byte big-endian length + JPEG bytes (no delimiters otherwise).
+@MainActor
 private func runStream() async throws {
   let window = try await findSimulatorWindow()
   let frame = window.frame
@@ -104,15 +191,18 @@ private func runStream() async throws {
   guard let line = String(data: json, encoding: .utf8) else { throw HelperError.streamFailed("bounds encode") }
   FileHandle.standardError.write(Data("BOUNDS:\(line)\n".utf8))
 
+  // Capture only this window (not the whole display).
   let filter = SCContentFilter(desktopIndependentWindow: window)
   let config = SCStreamConfiguration()
+  // ~2x size for Retina-ish sharpness; cap dimensions for safety.
   config.width = Int(min(frame.width * 2, 4096))
   config.height = Int(min(frame.height * 2, 4096))
-  config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+  config.minimumFrameInterval = CMTime(value: 1, timescale: 30)  // ~30 fps
   config.pixelFormat = kCVPixelFormatType_32BGRA as OSType
   config.showsCursor = false
   config.capturesAudio = false
 
+  // Encode + write on a background queue; lock stdout so frame writes don’t interleave.
   let stdoutLock = NSLock()
   let output = StreamOutput { data in
     var len = UInt32(data.count).bigEndian
@@ -127,6 +217,8 @@ private func runStream() async throws {
   try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue.global(qos: .userInitiated))
   try await stream.startCapture()
 
+  // Block until stdin is closed (extension disposes the child or closes the pipe).
+  // `withCheckedContinuation` bridges callback-style async APIs into Swift `async`.
   await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
     DispatchQueue.global(qos: .utility).async {
       _ = FileHandle.standardInput.readDataToEndOfFile()
@@ -137,9 +229,20 @@ private func runStream() async throws {
   try await stream.stopCapture()
 }
 
+// MARK: - Entry point
+
+/// `@main` tells Swift this is the program entry. `async` lets us use `await` here.
+///
+/// Flow: initialize Window Server on the main thread → parse argv → either one-shot
+/// `click` or long-running `stream`.
 @main
 enum Entry {
   static func main() async {
+    // Must run on main: touching NSApplication from a background thread is unsafe.
+    await MainActor.run {
+      connectToWindowServer()
+    }
+
     let args = CommandLine.arguments.dropFirst()
     guard let first = args.first else {
       fputs("\(HelperError.usage)\n", stderr)
@@ -154,7 +257,9 @@ enum Entry {
         fputs("\(HelperError.usage)\n", stderr)
         exit(2)
       }
-      postClick(quartzGlobal: CGPoint(x: x, y: y))
+      await MainActor.run {
+        postClick(quartzGlobal: CGPoint(x: x, y: y))
+      }
       exit(0)
     }
 
