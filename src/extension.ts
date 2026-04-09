@@ -5,6 +5,8 @@ import * as path from "path";
 import * as readline from "readline";
 import * as vscode from "vscode";
 
+import { hidSessionLinesForTextBatch, hidSessionLinesForWebKey, type WebKeyFields } from "./hidKeyboard";
+
 let activePanel: vscode.WebviewPanel | undefined;
 let streamProcess: cp.ChildProcessWithoutNullStreams | undefined;
 let lastFramePostedAt = 0;
@@ -77,6 +79,7 @@ type StreamPanelInitPayload = {
   streamPads: StreamPads;
   streamLayout: { maxWidthPx: number; maxHeightPx: number };
   streamShowUsageHint: boolean;
+  forwardSimulatorKeys: boolean;
 };
 
 function streamPanelInitPayload(): StreamPanelInitPayload {
@@ -91,6 +94,7 @@ function streamPanelInitPayload(): StreamPanelInitPayload {
       maxHeightPx: typeof maxH === "number" && Number.isFinite(maxH) ? Math.max(0, Math.round(maxH)) : 0,
     },
     streamShowUsageHint: !!cfg.get("streamShowUsageHint"),
+    forwardSimulatorKeys: cfg.get<boolean>("forwardSimulatorKeys") !== false,
   };
 }
 
@@ -228,6 +232,7 @@ function panelHtml(webview: vscode.Webview): string {
       Debug: <code>debugMap</code>, <code>debugTouches</code>, <code>debugTouchPipeline</code>; command <strong>Touch / MAP debug checklist</strong>. Reopen the panel after MAP / pipeline env changes.
       Command <strong>Select booted simulator (UDID)</strong> or <code>simulatorUdid</code> when several devices are booted. Toolbar: Home (double-click quickly for app switcher), Screenshot, Rotate — host shortcuts via Simulator + Accessibility.
       <strong>Spaces:</strong> Simulator must be on the <strong>same desktop</strong> as the editor to <strong>start</strong> the stream; after it runs you can move Simulator elsewhere (stream/touch often keep working; toolbar buttons may not if Simulator is not on this Space).
+      <strong>Keyboard:</strong> After you <strong>press on the stream image</strong>, key events are forwarded with <strong>Indigo HID</strong> (same <code>touch sess</code> as touches). Typing stops when the panel loses focus or you switch away. Host shortcuts may still intercept some chords.
     </div>
   </details>
   <div id="chromeBar" role="toolbar" aria-label="Simulator window actions">
@@ -259,7 +264,119 @@ function panelHtml(webview: vscode.Webview): string {
     const debugHud = document.getElementById('debugHud');
     let activePointer = null;
     let debugTouches = false;
+    let forwardKeys = true;
+    /** After a pointer down on the stream image; cleared on blur / hidden / inactive panel. */
+    let keyboardListening = false;
     let streamPads = { padLeft: 0, padRight: 0, padTop: 0, padBottom: 0 };
+    const KEY_FLUSH_MS = 45;
+    let keyTextBuf = '';
+    let keyFlushTimer = null;
+
+    function clearKeyTextBuf() {
+      keyTextBuf = '';
+      if (keyFlushTimer) {
+        clearTimeout(keyFlushTimer);
+        keyFlushTimer = null;
+      }
+    }
+
+    function flushKeyTextBuf() {
+      if (!forwardKeys || !keyTextBuf.length) return;
+      const t = keyTextBuf;
+      keyTextBuf = '';
+      keyFlushTimer = null;
+      vscode.postMessage({ type: 'simKeyBatch', text: t });
+    }
+
+    function scheduleKeyFlush() {
+      if (keyFlushTimer) clearTimeout(keyFlushTimer);
+      keyFlushTimer = setTimeout(flushKeyTextBuf, KEY_FLUSH_MS);
+    }
+
+    function stopKeyboardListening() {
+      keyboardListening = false;
+      clearKeyTextBuf();
+    }
+
+    /** Physical key codes → HID usage (see src/hidKeyboard.ts). */
+    const SIM_KEY_CODES = {
+      ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1,
+      Enter: 1, NumpadEnter: 1, Tab: 1, Escape: 1, Backspace: 1, Delete: 1,
+      Home: 1, End: 1, PageUp: 1, PageDown: 1,
+      F1: 1, F2: 1, F3: 1, F4: 1, F5: 1, F6: 1, F7: 1, F8: 1, F9: 1, F10: 1, F11: 1, F12: 1
+    };
+
+    function isSpecialSimKey(ev) {
+      if (ev.code === 'Space') return true;
+      return SIM_KEY_CODES[ev.code] !== undefined || /^F([1-9]|1[0-2])$/.test(ev.code);
+    }
+
+    function isPrintableForBuffer(ev) {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return false;
+      if (ev.key.length !== 1) return false;
+      const cp = ev.key.charCodeAt(0);
+      if (cp < 32 || cp === 127) return false;
+      return true;
+    }
+
+    /* Modifier chords: macOS often gives Ctrl+Option+letter a non-printable key; code stays KeyA…KeyZ. */
+    function shouldForwardModifierChord(ev) {
+      if (!(ev.metaKey || ev.ctrlKey || ev.altKey)) return false;
+      if (ev.key === 'Unidentified' || ev.key === 'Process') return false;
+      if (/^Key[A-Z]$/.test(ev.code)) return true;
+      if (/^Digit[0-9]$/.test(ev.code)) return true;
+      if (ev.code === 'Space') return true;
+      if (isSpecialSimKey(ev)) return true;
+      if (ev.key.length === 1) {
+        const c = ev.key.charCodeAt(0);
+        if (c >= 32 && c !== 127) return true;
+      }
+      return false;
+    }
+
+    function postSimKey(ev) {
+      vscode.postMessage({
+        type: 'simKey',
+        key: ev.key,
+        code: ev.code,
+        repeat: ev.repeat,
+        metaKey: ev.metaKey,
+        ctrlKey: ev.ctrlKey,
+        altKey: ev.altKey,
+        shiftKey: ev.shiftKey
+      });
+    }
+
+    window.addEventListener(
+      'keydown',
+      (ev) => {
+        if (!forwardKeys || !keyboardListening) return;
+        if (isSpecialSimKey(ev) || shouldForwardModifierChord(ev)) {
+          flushKeyTextBuf();
+          ev.preventDefault();
+          ev.stopPropagation();
+          postSimKey(ev);
+          return;
+        }
+        if (isPrintableForBuffer(ev)) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          keyTextBuf += ev.key;
+          scheduleKeyFlush();
+          return;
+        }
+        flushKeyTextBuf();
+        if (ev.key.length > 1 && !isSpecialSimKey(ev)) return;
+        if (ev.key === 'Unidentified' || ev.key === 'Process') {
+          ev.preventDefault();
+          return;
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+        postSimKey(ev);
+      },
+      true
+    );
 
     function applyStreamLayout(layout) {
       if (!layout || typeof layout !== 'object') return;
@@ -302,7 +419,11 @@ function panelHtml(webview: vscode.Webview): string {
           w +
           ' × ' +
           h +
-          ' (streamMaxWidthPx / streamMaxHeightPx). Same Space as the editor to start capture; toolbar needs Simulator on current Space. streamShowUsageHint for full notes.';
+          ' (streamMaxWidthPx / streamMaxHeightPx). Tap stream to type (HID); stops when panel loses focus. streamShowUsageHint for full notes.';
+      }
+      forwardKeys = init.forwardSimulatorKeys !== false;
+      if (!forwardKeys) {
+        stopKeyboardListening();
       }
     }
 
@@ -323,9 +444,13 @@ function panelHtml(webview: vscode.Webview): string {
         if (msg.streamPads && typeof msg.streamPads === 'object') {
           streamPads = { ...streamPads, ...msg.streamPads };
         }
+        stopKeyboardListening();
         applyStreamChrome(msg);
         debugHud.hidden = !debugTouches;
         if (!debugTouches) debugHud.textContent = '';
+      }
+      if (msg && msg.type === 'keyboardListening' && msg.enabled === false) {
+        stopKeyboardListening();
       }
       if (msg && msg.type === 'streamMap' && msg.pads && typeof msg.pads === 'object') {
         streamPads = { ...streamPads, ...msg.pads };
@@ -424,6 +549,9 @@ function panelHtml(webview: vscode.Webview): string {
       ev.preventDefault();
       const p = relCoords(ev);
       if (!p || !p.nw || !p.nh) return;
+      if (forwardKeys) {
+        keyboardListening = true;
+      }
       try { img.setPointerCapture(ev.pointerId); } catch (_) {}
       activePointer = ev.pointerId;
       lastTouchSample = p;
@@ -478,7 +606,15 @@ function panelHtml(webview: vscode.Webview): string {
       },
       true
     );
-    window.addEventListener('blur', () => finishActivePointer('touchCancel'));
+    window.addEventListener('blur', () => {
+      stopKeyboardListening();
+      finishActivePointer('touchCancel');
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopKeyboardListening();
+      }
+    });
 
     vscode.postMessage({ type: 'panelReady' });
   </script>
@@ -933,6 +1069,58 @@ function getFrontmostAppBundleIdSync(): string | undefined {
   }
 }
 
+function forwardHidKeyboardLines(context: vscode.ExtensionContext, lines: string[]): void {
+  if (lines.length === 0) {
+    return;
+  }
+  const bin = ensureHelperBuilt(context);
+  if (!bin) {
+    return;
+  }
+  const env = helperEnvForCapture();
+  if (!ensureTouchSession(bin, env)) {
+    void vscode.window.showErrorMessage(
+      "Could not start HID session for keyboard; rebuild the native helper (npm run build:native)."
+    );
+    return;
+  }
+  for (const line of lines) {
+    sendTouchSessionLine(line);
+  }
+}
+
+function handleSimKeyBatchFromWebview(context: vscode.ExtensionContext, m: Record<string, unknown>) {
+  if (!isMacOSHost()) {
+    return;
+  }
+  const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+  if (cfg.get<boolean>("forwardSimulatorKeys") === false) {
+    return;
+  }
+  const text = typeof m.text === "string" ? m.text : "";
+  forwardHidKeyboardLines(context, hidSessionLinesForTextBatch(text));
+}
+
+function handleSimKeyFromWebview(context: vscode.ExtensionContext, m: Record<string, unknown>) {
+  if (!isMacOSHost()) {
+    return;
+  }
+  const cfg = vscode.workspace.getConfiguration("ios-simulator-embed");
+  if (cfg.get<boolean>("forwardSimulatorKeys") === false) {
+    return;
+  }
+  const ev: WebKeyFields = {
+    key: typeof m.key === "string" ? m.key : "",
+    code: typeof m.code === "string" ? m.code : "",
+    repeat: !!m.repeat,
+    metaKey: !!m.metaKey,
+    ctrlKey: !!m.ctrlKey,
+    altKey: !!m.altKey,
+    shiftKey: !!m.shiftKey,
+  };
+  forwardHidKeyboardLines(context, hidSessionLinesForWebKey(ev));
+}
+
 /**
  * Sends a keyboard shortcut while Simulator is briefly activated, then restores the previous front app.
  * Avoids leaving Simulator on top after chrome toolbar actions.
@@ -1119,6 +1307,9 @@ function runTouchMapDebugHelp() {
     "• ios-simulator-embed.streamJpegQuality — JPEG quality for the stream (reopen panel after change)."
   );
   debugOutputChannel.appendLine(
+    "• ios-simulator-embed.forwardSimulatorKeys — after tap on stream, keys via Indigo HID (touch sess); stops when panel loses focus."
+  );
+  debugOutputChannel.appendLine(
     "• ios-simulator-embed.homeToolbar* / homeAfter* / homeBetween* / homeBefore* — toolbar Home timing (ms)."
   );
   debugOutputChannel.appendLine("");
@@ -1142,7 +1333,7 @@ function runTouchMapDebugHelp() {
     "• Toolbar (Home, Screenshot, Rotate) — host Automation: Home supports two quick clicks for app switcher; simctl screenshot via temp file; Rotate ⌘→; needs Accessibility for System Events."
   );
   debugOutputChannel.appendLine(
-    "• Spaces (Mission Control) — put Simulator on the same desktop as the editor to start the stream; after capture runs you can move Simulator (stream/touch often keep working; toolbar may target Simulator on the current Space only)."
+    "• Spaces (Mission Control) — same desktop as the editor to start the stream; after capture, stream / touch / ⌨ HID keyboard usually keep working if you move Simulator; toolbar may target Simulator on the current Space only."
   );
   debugOutputChannel.appendLine(
     "• Notification / Control Center drawers — edge pans from top/bottom; confirm MAP pads (debugMap) so y≈0 / y≈1 hit the bezel area."
@@ -1203,7 +1394,8 @@ export function activate(context: vscode.ExtensionContext) {
         e.affectsConfiguration("ios-simulator-embed.debugTouches") ||
         e.affectsConfiguration("ios-simulator-embed.streamMaxWidthPx") ||
         e.affectsConfiguration("ios-simulator-embed.streamMaxHeightPx") ||
-        e.affectsConfiguration("ios-simulator-embed.streamShowUsageHint")
+        e.affectsConfiguration("ios-simulator-embed.streamShowUsageHint") ||
+        e.affectsConfiguration("ios-simulator-embed.forwardSimulatorKeys")
       ) {
         activePanel.webview.postMessage({ type: "init", ...streamPanelInitPayload() });
       }
@@ -1266,6 +1458,14 @@ export function activate(context: vscode.ExtensionContext) {
       activePanel = panel;
       panel.webview.html = panelHtml(panel.webview);
 
+      context.subscriptions.push(
+        panel.onDidChangeViewState((e) => {
+          if (!e.webviewPanel.active) {
+            void e.webviewPanel.webview.postMessage({ type: "keyboardListening", enabled: false });
+          }
+        })
+      );
+
       panel.webview.onDidReceiveMessage(
         (msg) => {
           if (!msg || typeof msg !== "object") {
@@ -1280,6 +1480,15 @@ export function activate(context: vscode.ExtensionContext) {
 
           if (m.type === "chrome" && typeof m.action === "string") {
             void runChromeAction(context, m.action);
+            return;
+          }
+
+          if (m.type === "simKey") {
+            handleSimKeyFromWebview(context, m);
+            return;
+          }
+          if (m.type === "simKeyBatch") {
+            handleSimKeyBatchFromWebview(context, m);
             return;
           }
 
