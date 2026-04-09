@@ -2,11 +2,12 @@
 // ios-sim-helper — small macOS command-line tool for the VS Code extension
 // =============================================================================
 //
-// Two modes (chosen by the first argument):
-//   stream — finds the Simulator window, captures it with ScreenCaptureKit, and
-//            writes JPEG frames to stdout (length-prefixed). Sends one BOUNDS
-//            line on stderr so the extension can map clicks to screen coords.
+// Modes (first argument):
+//   stream — picks a Simulator window by **bundle ID** (see findSimulatorWindow), captures
+//            it with ScreenCaptureKit, writes JPEG frames to stdout (length-prefixed).
+//            Sends one BOUNDS line on stderr for click mapping.
 //   click  — synthesizes a left click at Quartz global (x, y).
+//   list   — prints every shareable on-screen window as **NDJSON** (debug: bundleId, title, …).
 //
 // The extension spawns this binary; it is not a .app bundle, so we must
 // explicitly connect to the Window Server (see connectToWindowServer).
@@ -51,15 +52,23 @@ private func connectToWindowServer() {
 /// stringifies for `"\(error)"` via the `description` property.
 enum HelperError: Error, CustomStringConvertible {
   case usage
-  case noSimulatorWindow
+  case noSimulatorWindow(String)
   case streamFailed(String)
 
   var description: String {
     switch self {
     case .usage:
-      return "Usage:\n  ios-sim-helper stream\n  ios-sim-helper click <x> <y>  (Quartz global coordinates)"
-    case .noSimulatorWindow:
-      return "No iOS Simulator window found. Open Simulator and a booted device first."
+      return """
+      Usage:
+        ios-sim-helper stream              # capture (stderr BOUNDS, stdout JPEG frames)
+        ios-sim-helper click <x> <y>       # Quartz global point click
+        ios-sim-helper list                # NDJSON lines: all windows (use to read bundle IDs)
+
+      Optional environment:
+        IOS_SIM_HELPER_BUNDLE_ID=<id>      # exact owning bundle; only those windows are candidates for stream
+      """
+    case .noSimulatorWindow(let hint):
+      return "No capture window found. \(hint)"
     case .streamFailed(let msg):
       return "Stream error: \(msg)"
     }
@@ -68,40 +77,97 @@ enum HelperError: Error, CustomStringConvertible {
 
 // MARK: - Finding the Simulator window
 
-/// Asks ScreenCaptureKit for every on-screen window, then picks the Simulator.
+/// Bundle IDs that usually own Simulator UI. **Do not** match on window title — titles like
+/// “main” also appear on VS Code / Cursor (`main` branch), which led to capturing the wrong app.
+private func isDefaultSimulatorBundle(_ bundleId: String) -> Bool {
+  if bundleId == "com.apple.iphonesimulator" { return true }
+  if bundleId.hasPrefix("com.apple.CoreSimulator.") { return true }
+  return false
+}
+
+/// Asks ScreenCaptureKit for on-screen windows, filters by **bundle ID only**, then picks the largest.
 ///
-/// `@MainActor` forces this to run on the main thread. Apple’s capture APIs expect
-/// UI-thread affinity in practice; the VS Code–spawned CLI would otherwise skip
-/// normal app startup, so we pair this with `connectToWindowServer()`.
-///
-/// `async throws` means: may suspend (await) and may fail (`throw`); callers use
-/// `try await`.
+/// Set `IOS_SIM_HELPER_BUNDLE_ID` to an exact id from `ios-sim-helper list` if the default list misses your setup.
 @MainActor
 private func findSimulatorWindow() async throws -> SCWindow {
-  // Snapshot of shareable content: windows, displays, apps (async system call).
   let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+  let envBid =
+    ProcessInfo.processInfo.environment["IOS_SIM_HELPER_BUNDLE_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+    ?? ""
 
-  // Heuristic filters: bundle IDs Apple uses for Simulator, plus title patterns
-  // (e.g. “main — iOS …” when the device name is “main”).
   let candidates = content.windows.filter { window in
     let bid = window.owningApplication?.bundleIdentifier ?? ""
-    if bid == "com.apple.iphonesimulator" { return true }
-    if bid.contains("CoreSimulator") { return true }
-    if bid.contains("Simulator") { return true }
-    let title = window.title ?? ""
-    // Comma between conditions = logical AND. The `||` group matches common title shapes.
-    if title.contains("iOS"), title.contains("—") || title.contains("-") || title.contains("main") { return true }
-    return false
+    if envBid.isEmpty {
+      return isDefaultSimulatorBundle(bid)
+    }
+    return bid == envBid
   }
 
-  // Ignore tiny helper windows (icons, chrome); keep anything reasonably large.
   let sized = candidates.filter { $0.frame.width >= 120 && $0.frame.height >= 120 }
   func area(_ w: SCWindow) -> CGFloat { w.frame.width * w.frame.height }
   guard let best = sized.max(by: { area($0) < area($1) })
   else {
-    throw HelperError.noSimulatorWindow
+    let hint: String
+    if envBid.isEmpty {
+      hint =
+        "Open Simulator with a booted device, or run `ios-sim-helper list` and set IOS_SIM_HELPER_BUNDLE_ID to the Simulator row’s bundleId."
+    } else {
+      hint =
+        "No on-screen window with bundle id \"\(envBid)\". Run `ios-sim-helper list` and copy the exact bundleId for the Simulator window."
+    }
+    throw HelperError.noSimulatorWindow(hint)
   }
   return best
+}
+
+// MARK: - Debug: list windows
+
+/// One line per window, NDJSON. Use to discover `bundleId` / `windowID` without guessing from titles.
+@MainActor
+private func listCaptureCandidates() async throws {
+  let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+
+  struct Row: Encodable {
+    let bundleId: String
+    let appName: String
+    let title: String
+    let windowID: UInt64
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let area: Double
+  }
+
+  var rows: [Row] = []
+  for w in content.windows {
+    let bid = w.owningApplication?.bundleIdentifier ?? ""
+    let name = w.owningApplication?.applicationName ?? ""
+    let title = w.title ?? ""
+    let f = w.frame
+    let wid = UInt64(w.windowID)
+    rows.append(
+      Row(
+        bundleId: bid,
+        appName: name,
+        title: title,
+        windowID: wid,
+        x: Double(f.origin.x),
+        y: Double(f.origin.y),
+        width: Double(f.width),
+        height: Double(f.height),
+        area: Double(f.width * f.height)))
+  }
+  rows.sort { $0.area > $1.area }
+
+  let enc = JSONEncoder()
+  enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+  for r in rows {
+    let data = try enc.encode(r)
+    if let line = String(data: data, encoding: .utf8) {
+      print(line)
+    }
+  }
 }
 
 // MARK: - Frame encoding (video sample → JPEG bytes)
@@ -306,6 +372,16 @@ enum Entry {
     if first == "stream" {
       do {
         try await runStream()
+        exit(0)
+      } catch {
+        fputs("\(error)\n", stderr)
+        exit(1)
+      }
+    }
+
+    if first == "list" {
+      do {
+        try await listCaptureCandidates()
         exit(0)
       } catch {
         fputs("\(error)\n", stderr)

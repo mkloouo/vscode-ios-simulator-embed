@@ -12,7 +12,8 @@
   ],
   "activationEvents": [
     "onCommand:ios-simulator-embed.openPanel",
-    "onCommand:ios-simulator-embed.stopPanel"
+    "onCommand:ios-simulator-embed.stopPanel",
+    "onCommand:ios-simulator-embed.listWindows"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -24,8 +25,23 @@
       {
         "command": "ios-simulator-embed.stopPanel",
         "title": "iOS Simulator: Stop stream"
+      },
+      {
+        "command": "ios-simulator-embed.listWindows",
+        "title": "iOS Simulator: List capture windows (debug)"
       }
-    ]
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "iOS Simulator Embed",
+      "properties": {
+        "ios-simulator-embed.targetBundleId": {
+          "type": "string",
+          "default": "",
+          "description": "If set, only windows whose owning bundle ID equals this value are streamed (copy bundleId from “List capture windows” NDJSON). Example: com.apple.iphonesimulator"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

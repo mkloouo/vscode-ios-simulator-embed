@@ -11,6 +11,20 @@ let streamProcess: cp.ChildProcessWithoutNullStreams | undefined;
 let latestBounds: Bounds | undefined;
 let lastFramePostedAt = 0;
 
+const debugOutputChannel = vscode.window.createOutputChannel("iOS Simulator Embed");
+
+/** Merged env for stream/click so the helper can filter by bundle ID. */
+function helperEnvForCapture(): NodeJS.ProcessEnv {
+  const id = vscode.workspace
+    .getConfiguration("ios-simulator-embed")
+    .get<string>("targetBundleId")
+    ?.trim();
+  if (id) {
+    return { ...process.env, IOS_SIM_HELPER_BUNDLE_ID: id };
+  }
+  return { ...process.env };
+}
+
 function helperPath(context: vscode.ExtensionContext): string {
   return path.join(
     context.extensionPath,
@@ -111,7 +125,10 @@ function startStream(context: vscode.ExtensionContext, panel: vscode.WebviewPane
   stopStream();
   lastFramePostedAt = 0;
 
-  const child = cp.spawn(bin, ["stream"], { stdio: ["pipe", "pipe", "pipe"] });
+  const child = cp.spawn(bin, ["stream"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: helperEnvForCapture(),
+  });
   streamProcess = child;
 
   const rl = readline.createInterface({ input: child.stderr });
@@ -185,7 +202,46 @@ function mapClickToQuartz(
   return { x: qx, y: qy };
 }
 
+function runListWindowsDebug(context: vscode.ExtensionContext) {
+  const bin = ensureHelperBuilt(context);
+  if (!bin) {
+    return;
+  }
+  debugOutputChannel.clear();
+  debugOutputChannel.appendLine(
+    "ios-sim-helper list — NDJSON lines, largest windows first. Fields: bundleId, appName, title, windowID, x, y, width, height, area."
+  );
+  debugOutputChannel.appendLine(
+    "Set `ios-simulator-embed.targetBundleId` to the Simulator row’s `bundleId` if the default stream target is wrong."
+  );
+  debugOutputChannel.appendLine("");
+  const child = cp.spawn(bin, ["list"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env },
+  });
+  let combined = "";
+  child.stdout?.on("data", (d: Buffer) => {
+    combined += d.toString("utf8");
+  });
+  child.stderr?.on("data", (d: Buffer) => {
+    combined += d.toString("utf8");
+  });
+  child.on("error", (err) => {
+    debugOutputChannel.appendLine(`spawn error: ${String(err)}`);
+    debugOutputChannel.show(true);
+  });
+  child.on("close", (code) => {
+    debugOutputChannel.appendLine(combined.trimEnd() || "(no stdout/stderr)");
+    if (code !== 0) {
+      debugOutputChannel.appendLine(`(exit code ${code})`);
+    }
+    debugOutputChannel.show(true);
+  });
+}
+
 export function activate(context: vscode.ExtensionContext) {
+  context.subscriptions.push(debugOutputChannel);
+
   context.subscriptions.push(
     vscode.commands.registerCommand("ios-simulator-embed.openPanel", () => {
       if (activePanel) {
@@ -219,6 +275,7 @@ export function activate(context: vscode.ExtensionContext) {
           cp.spawn(bin, ["click", String(pt.x), String(pt.y)], {
             stdio: "ignore",
             detached: true,
+            env: helperEnvForCapture(),
           }).unref();
         },
         undefined,
@@ -238,6 +295,12 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("ios-simulator-embed.stopPanel", () => {
       stopStream();
       activePanel?.dispose();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("ios-simulator-embed.listWindows", () => {
+      runListWindowsDebug(context);
     })
   );
 }
