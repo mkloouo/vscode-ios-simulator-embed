@@ -2,9 +2,10 @@
   "name": "ios-simulator-embed",
   "displayName": "iOS Simulator (streamed panel)",
   "description": "macOS only: stream the iOS Simulator into a VS Code webview (ScreenCaptureKit) and forward touches (SimulatorKit Indigo HID).",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "mkloouo",
   "license": "Apache-2.0",
+  "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
