@@ -213,6 +213,7 @@ function panelHtml(webview: vscode.Webview): string {
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     #wrap { position: relative; display: block; width: 100%; max-width: 100%; box-sizing: border-box; }
     #frame { display: block; width: auto; height: auto; max-width: 100%; cursor: pointer; user-select: none; touch-action: none; background: #111; box-sizing: border-box; }
+    #frame:focus-visible { outline: 2px solid var(--vscode-focusBorder, Highlight); outline-offset: 2px; }
     .hint-compact { font-size: 12px; opacity: 0.8; margin: 0 0 8px 0; line-height: 1.35; }
     #hintDetails { font-size: 12px; margin-bottom: 8px; line-height: 1.35; }
     #hintDetails[hidden] { display: none !important; }
@@ -250,7 +251,7 @@ function panelHtml(webview: vscode.Webview): string {
     </button>
   </div>
   <div id="wrap">
-    <img id="frame" alt="Simulator stream" draggable="false" />
+    <img id="frame" alt="Simulator stream" draggable="false" tabindex="-1" />
     <pre id="debugHud" hidden></pre>
   </div>
   </div>
@@ -547,6 +548,11 @@ function panelHtml(webview: vscode.Webview): string {
     img.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       ev.preventDefault();
+      /* Host often keeps focus in the editor; pointerdown default focus is suppressed by preventDefault. */
+      vscode.postMessage({ type: 'focusStreamPanel' });
+      try {
+        img.focus({ preventScroll: true });
+      } catch (_) {}
       const p = relCoords(ev);
       if (!p || !p.nw || !p.nh) return;
       if (forwardKeys) {
@@ -1489,6 +1495,11 @@ export function activate(context: vscode.ExtensionContext) {
           }
           if (m.type === "simKeyBatch") {
             handleSimKeyBatchFromWebview(context, m);
+            return;
+          }
+
+          if (m.type === "focusStreamPanel") {
+            panel.reveal(undefined, false);
             return;
           }
 
