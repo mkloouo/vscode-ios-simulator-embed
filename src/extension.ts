@@ -453,6 +453,15 @@ function panelHtml(webview: vscode.Webview): string {
       if (msg && msg.type === 'keyboardListening' && msg.enabled === false) {
         stopKeyboardListening();
       }
+      if (msg && msg.type === 'focusStreamImage') {
+        if (forwardKeys) {
+          keyboardListening = true;
+        }
+        try {
+          img.focus({ preventScroll: true });
+        } catch (_) {}
+        return;
+      }
       if (msg && msg.type === 'streamMap' && msg.pads && typeof msg.pads === 'object') {
         streamPads = { ...streamPads, ...msg.pads };
       }
@@ -548,11 +557,10 @@ function panelHtml(webview: vscode.Webview): string {
     img.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       ev.preventDefault();
-      /* Host often keeps focus in the editor; pointerdown default focus is suppressed by preventDefault. */
+      /* Host often keeps focus in the editor; pointerdown default focus is suppressed by preventDefault.
+         Extension calls reveal() then posts focusStreamImage so focus lands in this iframe after the host settles
+         (reveal briefly blurs the iframe — see deferred window blur below). */
       vscode.postMessage({ type: 'focusStreamPanel' });
-      try {
-        img.focus({ preventScroll: true });
-      } catch (_) {}
       const p = relCoords(ev);
       if (!p || !p.nw || !p.nh) return;
       if (forwardKeys) {
@@ -613,8 +621,16 @@ function panelHtml(webview: vscode.Webview): string {
       true
     );
     window.addEventListener('blur', () => {
-      stopKeyboardListening();
-      finishActivePointer('touchCancel');
+      /* reveal(preserveFocus:false) can blur this document momentarily; don't drop keyboardListening or cancel the touch until focus stays gone. */
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (document.hasFocus()) {
+            return;
+          }
+          stopKeyboardListening();
+          finishActivePointer('touchCancel');
+        });
+      });
     });
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
@@ -1500,6 +1516,9 @@ export function activate(context: vscode.ExtensionContext) {
 
           if (m.type === "focusStreamPanel") {
             panel.reveal(undefined, false);
+            setTimeout(() => {
+              void panel.webview.postMessage({ type: "focusStreamImage" });
+            }, 0);
             return;
           }
 

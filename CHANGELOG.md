@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Stream panel focus on tap** — A pointer down on the JPEG used `preventDefault()`, so the webview often never received keyboard focus (typing required clicking the tab title or blank chrome first). The panel now **reveals with focus** from the extension host, and the stream image is **programmatically focused** (`tabindex="-1"`) so keys reach the simulator right after you tap the stream.
+- **Follow-up:** `reveal()` could **blur the iframe** briefly; the webview’s `window` `blur` handler was clearing **`keyboardListening`**, so key events fell through to the host/page. Blur is now **deferred** (double `requestAnimationFrame` + `document.hasFocus()`), and the host posts **`focusStreamImage`** after `reveal` to refocus the stream `img` and re-arm keyboard forwarding when needed.
 
 ## [1.3.3] - 2026-04-09
 
