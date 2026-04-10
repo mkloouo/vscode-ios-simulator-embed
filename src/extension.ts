@@ -187,6 +187,17 @@ function stopStream() {
   streamProcess = undefined;
 }
 
+/**
+ * Focus the stream webview in the workbench, then ask the iframe to focus the stream `<img>` on the next turn.
+ * A bare `reveal` can blur the iframe momentarily; `focusStreamImage` runs after the host settles.
+ */
+function revealStreamPanelAndFocusStreamImage(panel: vscode.WebviewPanel): void {
+  panel.reveal(undefined, false);
+  setTimeout(() => {
+    void panel.webview.postMessage({ type: "focusStreamImage" });
+  }, 0);
+}
+
 function panelHtml(webview: vscode.Webview): string {
   const csp = [
     `default-src 'none';`,
@@ -299,7 +310,17 @@ function panelHtml(webview: vscode.Webview): string {
       clearKeyTextBuf();
     }
 
-    /** Physical key codes → HID usage (see src/hidKeyboard.ts). */
+    /** Host sends this after reveal; re-arms forwarding if blur cleared it and moves focus to the stream bitmap. */
+    function applyFocusStreamImageMessage() {
+      if (forwardKeys) {
+        keyboardListening = true;
+      }
+      try {
+        img.focus({ preventScroll: true });
+      } catch (_) {}
+    }
+
+    /** Keys that must use simKey (not the printable buffer). Values are only truthy sentinels. */
     const SIM_KEY_CODES = {
       ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1,
       Enter: 1, NumpadEnter: 1, Tab: 1, Escape: 1, Backspace: 1, Delete: 1,
@@ -437,33 +458,42 @@ function panelHtml(webview: vscode.Webview): string {
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg && msg.type === 'frame' && typeof msg.dataUrl === 'string') {
-        img.src = msg.dataUrl;
-      }
-      if (msg && msg.type === 'init') {
-        debugTouches = !!msg.debugTouches;
-        if (msg.streamPads && typeof msg.streamPads === 'object') {
-          streamPads = { ...streamPads, ...msg.streamPads };
-        }
-        stopKeyboardListening();
-        applyStreamChrome(msg);
-        debugHud.hidden = !debugTouches;
-        if (!debugTouches) debugHud.textContent = '';
-      }
-      if (msg && msg.type === 'keyboardListening' && msg.enabled === false) {
-        stopKeyboardListening();
-      }
-      if (msg && msg.type === 'focusStreamImage') {
-        if (forwardKeys) {
-          keyboardListening = true;
-        }
-        try {
-          img.focus({ preventScroll: true });
-        } catch (_) {}
+      if (!msg || typeof msg !== 'object') {
         return;
       }
-      if (msg && msg.type === 'streamMap' && msg.pads && typeof msg.pads === 'object') {
-        streamPads = { ...streamPads, ...msg.pads };
+      switch (msg.type) {
+        case 'frame':
+          if (typeof msg.dataUrl === 'string') {
+            img.src = msg.dataUrl;
+          }
+          break;
+        case 'init':
+          debugTouches = !!msg.debugTouches;
+          if (msg.streamPads && typeof msg.streamPads === 'object') {
+            streamPads = { ...streamPads, ...msg.streamPads };
+          }
+          stopKeyboardListening();
+          applyStreamChrome(msg);
+          debugHud.hidden = !debugTouches;
+          if (!debugTouches) {
+            debugHud.textContent = '';
+          }
+          break;
+        case 'keyboardListening':
+          if (msg.enabled === false) {
+            stopKeyboardListening();
+          }
+          break;
+        case 'focusStreamImage':
+          applyFocusStreamImageMessage();
+          break;
+        case 'streamMap':
+          if (msg.pads && typeof msg.pads === 'object') {
+            streamPads = { ...streamPads, ...msg.pads };
+          }
+          break;
+        default:
+          break;
       }
     });
 
@@ -557,9 +587,7 @@ function panelHtml(webview: vscode.Webview): string {
     img.addEventListener('pointerdown', (ev) => {
       if (ev.button !== 0) return;
       ev.preventDefault();
-      /* Host often keeps focus in the editor; pointerdown default focus is suppressed by preventDefault.
-         Extension calls reveal() then posts focusStreamImage so focus lands in this iframe after the host settles
-         (reveal briefly blurs the iframe — see deferred window blur below). */
+      /* preventDefault stops the browser from focusing here; extension reveals the panel and sends focusStreamImage. */
       vscode.postMessage({ type: 'focusStreamPanel' });
       const p = relCoords(ev);
       if (!p || !p.nw || !p.nh) return;
@@ -620,8 +648,12 @@ function panelHtml(webview: vscode.Webview): string {
       },
       true
     );
-    window.addEventListener('blur', () => {
-      /* reveal(preserveFocus:false) can blur this document momentarily; don't drop keyboardListening or cancel the touch until focus stays gone. */
+
+    /**
+     * After WebviewPanel.reveal(), the iframe can blur for a frame or two. Wait two animation frames, then
+     * disarm only if focus did not return (real alt-tab / click outside).
+     */
+    function disarmStreamInputIfDocumentStillUnfocused() {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (document.hasFocus()) {
@@ -631,7 +663,9 @@ function panelHtml(webview: vscode.Webview): string {
           finishActivePointer('touchCancel');
         });
       });
-    });
+    }
+    window.addEventListener('blur', disarmStreamInputIfDocumentStillUnfocused);
+
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         stopKeyboardListening();
@@ -1515,10 +1549,7 @@ export function activate(context: vscode.ExtensionContext) {
           }
 
           if (m.type === "focusStreamPanel") {
-            panel.reveal(undefined, false);
-            setTimeout(() => {
-              void panel.webview.postMessage({ type: "focusStreamImage" });
-            }, 0);
+            revealStreamPanelAndFocusStreamImage(panel);
             return;
           }
 

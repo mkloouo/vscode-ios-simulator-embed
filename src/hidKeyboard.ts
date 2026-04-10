@@ -137,6 +137,15 @@ function linesIncludeAltDown(lines: string[]): boolean {
   return lines.includes(`kd ${HID_LEFT_ALT}`);
 }
 
+/** Strip modifier flags that are already encoded inside `lines` (shift-chord / option-chord). */
+function webKeyWithoutRedundantChordModifiers(lines: string[], ev: WebKeyFields): WebKeyFields {
+  return {
+    ...ev,
+    shiftKey: linesIncludeShiftDown(lines) ? false : ev.shiftKey,
+    altKey: linesIncludeAltDown(lines) ? false : ev.altKey,
+  };
+}
+
 /**
  * US QWERTY: one character → HID lines (may include shift/alt inside).
  * ASCII 32–126; TAB/LF; null if unsupported.
@@ -153,9 +162,6 @@ export function hidLinesForAsciiChar(ch: string): string[] | null {
     return [kp(40)];
   }
   if (cp < 32 || cp > 126) {
-    return null;
-  }
-  if (cp === 127) {
     return null;
   }
 
@@ -311,22 +317,12 @@ export function hidSessionLinesForWebKey(ev: WebKeyFields): string[] {
 
   const ascii = hidLinesForAsciiChar(k);
   if (ascii !== null && ascii.length > 0) {
-    const ev2: WebKeyFields = {
-      ...ev,
-      shiftKey: linesIncludeShiftDown(ascii) ? false : ev.shiftKey,
-      altKey: linesIncludeAltDown(ascii) ? false : ev.altKey,
-    };
-    return wrapModifiers(ascii, ev2);
+    return wrapModifiers(ascii, webKeyWithoutRedundantChordModifiers(ascii, ev));
   }
 
   const latin = hidLinesForLatin1Char(k);
   if (latin.length > 0) {
-    const ev2: WebKeyFields = {
-      ...ev,
-      altKey: linesIncludeAltDown(latin) ? false : ev.altKey,
-      shiftKey: linesIncludeShiftDown(latin) ? false : ev.shiftKey,
-    };
-    return wrapModifiers(latin, ev2);
+    return wrapModifiers(latin, webKeyWithoutRedundantChordModifiers(latin, ev));
   }
 
   return [];
